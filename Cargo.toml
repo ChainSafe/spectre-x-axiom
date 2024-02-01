@@ -16,6 +16,7 @@ bincode = { version = "1.3.3" }
 
 # misc
 log = "0.4"
+url = "2.2.1"
 env_logger = "0.10"
 getset = "0.1.2"
 ark-std = { version = "0.3.0", features = ["print-trace"] }
@@ -54,10 +55,15 @@ axiom-codec = { version = "0.2.0", git = "https://github.com/axiom-crypto/axiom-
 # spectre
 lightclient-circuits = { version = "=0.1.0", path = "../Spectre/lightclient-circuits" }
 spectre-eth-types = { version = "=0.1.0", path = "../Spectre/eth-types", package = "eth-types" }
+spectre-preprocessor = { version = "=0.1.0", path = "../Spectre/preprocessor", package = "preprocessor" }
 
 # ethereum
+ssz_rs = { git = "https://github.com/ralexstokes/ssz-rs", rev = "5f1ec833718efa07bbbff427ab28a1eeaa706164" }
 ethers-core = { version = "=2.0.10" }
 ethers-providers = { version = "2.0.10" }
+ethereum-consensus-types = { git = "https://github.com/ChainSafe/ethereum-consensus-types", branch = "capella" }
+beacon-api-client = { git = "https://github.com/ralexstokes/ethereum-consensus.git", rev = "f3bff52e9c43866f231ec40c8ab0e34125a8957f" }
+
 
 [patch.crates-io]
 ssz_rs = { git = "https://github.com/ralexstokes/ssz-rs", rev = "5f1ec833718efa07bbbff427ab28a1eeaa706164" }

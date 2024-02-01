@@ -4,24 +4,32 @@
 //! Shard:
 //! - Step
 
-use std::marker::PhantomData;
-
-use axiom_codec::HiLo;
+use axiom_codec::{
+    types::{field_elements::FieldHeaderSubquery, native::HeaderSubquery},
+    HiLo,
+};
 use axiom_eth::{
-    impl_flatten_conversion, impl_logical_input,
     utils::{
-        build_utils::dummy::DummyFrom,
+        build_utils::{aggregation::CircuitMetadata, dummy::DummyFrom},
         bytes_be_to_u128,
         component::{
             circuit::{
                 ComponentBuilder, CoreBuilder, CoreBuilderOutput, CoreBuilderOutputParams,
                 CoreBuilderParams,
-            }, promise_collector::PromiseCaller, types::LogicalEmpty, utils::get_logical_value, ComponentType, ComponentTypeId, LogicalResult
+            },
+            promise_collector::PromiseCaller,
+            types::{FixLenLogical, Flatten, LogicalEmpty},
+            utils::get_logical_value,
+            ComponentType, ComponentTypeId, LogicalResult,
         },
     },
     Field,
 };
-use axiom_query::components::subqueries::storage::circuit::PayloadStorageSubquery;
+use axiom_query::components::subqueries::{block_header::circuit::PromiseLoaderHeaderSubquery, storage::circuit::PayloadStorageSubquery};
+use ethereum_consensus_types::{
+    light_client::ExecutionPayloadHeader,
+    presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES},
+};
 use halo2_base::{
     gates::flex_gate::threads::CommonCircuitBuilder, halo2_proofs::plonk::ConstraintSystem,
     safe_types::SafeTypeChip, AssignedValue,
@@ -32,17 +40,27 @@ use lightclient_circuits::{
     gadget::crypto::{Sha256Chip, ShaCircuitBuilder, ShaFlexGateManager},
     ssz_merkle::verify_merkle_proof,
     sync_step_circuit::StepCircuit,
-    witness::{HashInputChunk, SyncStepArgs},
+    witness::SyncStepArgs,
 };
 use lightclient_circuits::{gadget::to_bytes_le, util::IntoWitness};
 use serde::{Deserialize, Serialize};
 use spectre_eth_types::{Mainnet, LIMB_BITS, NUM_LIMBS};
+use std::marker::PhantomData;
+
+use crate::comp_circuit_impl::ComponentCircuitImpl;
+
+pub type ComponentCircuitBeaconSubquery<F> =
+    ComponentCircuitImpl<F, CoreBuilderBeaconSubquery<F>, PromiseLoaderHeaderSubquery<F>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitInputBeaconShard {
+    pub request: HeaderSubquery,
+
     pub step_args: SyncStepArgs<Mainnet>,
     pub exec_block_num_branch: Vec<Vec<u8>>,
-    pub exec_block_num: u64,
+
+    pub exec_payload_field_branch: Vec<Vec<u8>>,
+    pub exec_payload: ExecutionPayloadHeader<BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES>,
 }
 
 impl Default for CircuitInputBeaconShard {
@@ -51,43 +69,21 @@ impl Default for CircuitInputBeaconShard {
     }
 }
 
-const EXEC_BLOCK_NUM_INDEX: usize = 0; // TODO;
+pub const EXEC_BLOCK_NUM_GINDEX: usize = 0; // TODO;
+pub const EXEC_PAYLOAD_FIELD_GINDECES: [usize; 3] = [0, 1, 2]; // TODO;
+
+pub const EXEC_STATE_ROOT_INDEX: usize = 0;
 
 pub struct ComponentTypeBeaconSubquery<F: Field>(PhantomData<F>);
 
-pub const BITS_PER_FE_BEACON: [usize; 1] = [32];
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct FieldBeaconSubquery<T> {
-    pub block_number: T,
-}
-
-impl<T> TryFrom<Vec<T>> for FieldBeaconSubquery<T> {
-    type Error = std::io::Error;
-
-    fn try_from(value: Vec<T>) -> std::io::Result<Self> {
-        let [block_number] = value.try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid array length")
-        })?;
-        Ok(Self { block_number })
-    }
-}
-
-impl<T: Copy> FieldBeaconSubquery<T> {
-    pub fn flatten(self) -> [T; 1] {
-        [self.block_number]
-    }
-}
-
-impl_logical_input!(FieldBeaconSubquery, 1);
-impl_flatten_conversion!(FieldBeaconSubquery, BITS_PER_FE_BEACON);
+pub const BITS_PER_FE_BEACON: [usize; 2] = [32, 32];
 
 impl<F: Field> ComponentType<F> for ComponentTypeBeaconSubquery<F> {
-    type InputValue = FieldBeaconSubquery<F>;
-    type InputWitness = FieldBeaconSubquery<AssignedValue<F>>;
+    type InputValue = FieldHeaderSubquery<F>;
+    type InputWitness = FieldHeaderSubquery<AssignedValue<F>>;
     type OutputValue = HiLo<F>;
     type OutputWitness = HiLo<AssignedValue<F>>;
-    type LogicalInput = FieldBeaconSubquery<F>;
+    type LogicalInput = FieldHeaderSubquery<F>;
 
     fn get_type_id() -> ComponentTypeId {
         "spectre:BeaconSubquery".to_string()
@@ -146,10 +142,23 @@ impl DummyFrom<CoreParamsBeaconSubquery> for CircuitInputBeaconShard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalPublicInstanceBeacon<T: Copy> {
+    pub pub_inputs_commit: T,
+    pub poseidon_commit: T,
+}
+
+impl<F: Field> CircuitMetadata for CoreBuilderBeaconSubquery<F> {
+    const HAS_ACCUMULATOR: bool = false;
+    fn num_instance(&self) -> Vec<usize> {
+        unreachable!()
+    }
+}
+
 impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
     type CompType = ComponentTypeBeaconSubquery<F>;
-    type PublicInstanceValue = LogicalEmpty<F>;
-    type PublicInstanceWitness = LogicalEmpty<AssignedValue<F>>;
+    type PublicInstanceValue = LogicalPublicInstanceBeacon<F>;
+    type PublicInstanceWitness = LogicalPublicInstanceBeacon<AssignedValue<F>>;
     type CoreInput = CircuitInputBeaconShard;
     type CircuitBuilder = ShaCircuitBuilder<F, ShaFlexGateManager<F>>;
 
@@ -171,11 +180,11 @@ impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
         let input = self.input.take().unwrap();
         let sha256_chip = Sha256Chip::new(&range);
 
-        let (public_instances, execution_header_root) =
+        let (public_instances, execution_payload_root) =
             StepCircuit::synthesize(builder, &fp_chip, &input.step_args).unwrap();
 
         let execution_header_root_bytes =
-            SafeTypeChip::unsafe_to_fix_len_bytes_vec(execution_header_root.clone(), 32);
+            SafeTypeChip::unsafe_to_fix_len_bytes_vec(execution_payload_root.clone(), 32);
 
         let execution_header_root_hilo = HiLo::from_hi_lo(
             bytes_be_to_u128(builder.main(), &range.gate, execution_header_root_bytes.bytes())
@@ -183,7 +192,10 @@ impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
                 .unwrap(),
         );
 
-        let block_number = F::from(input.exec_block_num);
+        let field_idx = F::from(input.request.field_idx as u64);
+        let assigned_field_idx = builder.main().load_witness(field_idx);
+
+        let block_number = F::from(input.request.block_number as u64);
         let execution_block_number = builder.main().load_witness(block_number);
         let execution_block_number_bytes =
             to_bytes_le::<_, 32>(&execution_block_number, &range.gate, builder.main());
@@ -193,25 +205,89 @@ impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
             builder,
             &sha256_chip,
             input.exec_block_num_branch.iter().map(|w| w.clone().into_witness()),
-            execution_header_root.clone().into(),
-            &execution_block_number_bytes.to_vec(),
-            EXEC_BLOCK_NUM_INDEX,
-        ).unwrap();
+            execution_block_number_bytes.clone().into(),
+            &execution_payload_root,
+            EXEC_BLOCK_NUM_GINDEX,
+        )
+        .unwrap();
+
+        let execution_paload_field = builder.main().load_witness(block_number);
+        let execution_block_field_bytes =
+            to_bytes_le::<_, 32>(&execution_block_number, &range.gate, builder.main());
+
+        let execution_paload_fields = [
+            input.exec_payload.state_root,
+            input.exec_payload.receipts_root,
+            input.exec_payload.transactions_root,
+        ];
+
+        let execution_paload_field_bytes = execution_paload_fields
+            [input.request.field_idx as usize] // TODO: make field index dynamic
+            .as_ref()
+            .iter()
+            .map(|w| builder.main().load_witness(F::from(*w as u64)))
+            .collect_vec();
+
+        // Verify execution payload field against current state root via the Merkle proof
+        verify_merkle_proof(
+            builder,
+            &sha256_chip,
+            input.exec_block_num_branch.iter().map(|w| w.clone().into_witness()),
+            execution_paload_field_bytes.clone().into(),
+            &execution_payload_root,
+            EXEC_PAYLOAD_FIELD_GINDECES[input.request.field_idx as usize],
+        )
+        .unwrap();
 
         CoreBuilderOutput {
             public_instances,
-            virtual_table: Default::default(),
+            virtual_table: vec![(
+                FieldHeaderSubquery {
+                    block_number: execution_block_number,
+                    field_idx: assigned_field_idx,
+                }
+                .into(),
+                execution_header_root_hilo.into(),
+            )],
             logical_results: vec![LogicalResult::new(
-                FieldBeaconSubquery { block_number },
+                FieldHeaderSubquery { block_number, field_idx },
                 get_logical_value(&execution_header_root_hilo),
             )],
         }
     }
 }
 
-fn pad_to_32(le_bytes: &[u8]) -> Vec<u8> {
-    assert!(le_bytes.len() <= 32);
-    let mut chunk = le_bytes.to_vec();
-    chunk.resize(32, 0);
-    chunk
+
+impl<T: Copy> TryFrom<Vec<T>> for LogicalPublicInstanceBeacon<T> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Vec<T>) -> Result<Self, Self::Error> {
+        if value.len() != BITS_PER_PUBLIC_INSTANCE.len() {
+            return Err(anyhow::anyhow!("incorrect length"));
+        }
+        Ok(Self { pub_inputs_commit: value[0], poseidon_commit: value[1] })
+    }
+}
+
+const BITS_PER_PUBLIC_INSTANCE: [usize; 2] = [32, 32];
+
+impl<T: Copy> TryFrom<Flatten<T>> for LogicalPublicInstanceBeacon<T> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Flatten<T>) -> Result<Self, Self::Error> {
+        if value.field_size != BITS_PER_PUBLIC_INSTANCE {
+            return Err(anyhow::anyhow!("invalid field size"));
+        }
+        value.fields.try_into()
+    }
+}
+impl<T: Copy> From<LogicalPublicInstanceBeacon<T>> for Flatten<T> {
+    fn from(val: LogicalPublicInstanceBeacon<T>) -> Self {
+        Flatten { fields: vec![val.pub_inputs_commit, val.poseidon_commit], field_size: &BITS_PER_PUBLIC_INSTANCE }
+    }
+}
+impl<T: Copy> FixLenLogical<T> for LogicalPublicInstanceBeacon<T> {
+    fn get_field_size() -> &'static [usize] {
+        &BITS_PER_PUBLIC_INSTANCE
+    }
 }

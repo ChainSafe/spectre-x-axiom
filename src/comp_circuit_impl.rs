@@ -6,16 +6,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[cfg(feature = "aggregation")]
-use crate::utils::build_utils::aggregation::CircuitMetadata;
 use anyhow::anyhow;
 use axiom_eth::{
-    rlc::circuit::{builder::RlcCircuitBuilder, RlcConfig},
+    rlc::{
+        circuit::{builder::RlcCircuitBuilder, RlcCircuitParams, RlcConfig},
+        virtual_region::RlcThreadBreakPoints,
+    },
     snark_verifier_sdk,
     utils::{
         build_utils::{
             aggregation::CircuitMetadata,
-            pinning::{CircuitPinningInstructions, Halo2CircuitPinning},
+            pinning::{CircuitPinningInstructions, Halo2CircuitPinning, RlcCircuitPinning},
         },
         component::{
             circuit::{
@@ -47,9 +48,8 @@ use halo2_base::{
 use itertools::Itertools;
 
 use axiom_eth::Field;
-use lightclient_circuits::{
-    gadget::crypto::{SHAConfig, ShaCircuitBuilder, ShaFlexGateManager, SpreadConfig},
-    util::Eth2ConfigPinning,
+use lightclient_circuits::gadget::crypto::{
+    SHAConfig, ShaCircuitBuilder, ShaFlexGateManager, SpreadConfig,
 };
 use snark_verifier_sdk::CircuitExt;
 
@@ -127,10 +127,10 @@ where
     pub fn prover(
         core_builder_params: C::Params,
         promise_builder_params: P::Params,
-        prompt_rlc_pinning: Eth2ConfigPinning,
+        prompt_rlc_pinning: RlcCircuitPinning,
     ) -> Self {
-        Self::new_impl(true, core_builder_params, promise_builder_params, prompt_rlc_pinning.params)
-            .use_break_points(prompt_rlc_pinning.break_points)
+        Self::new_impl(true, core_builder_params, promise_builder_params, prompt_rlc_pinning.params.base)
+            .use_break_points(prompt_rlc_pinning.break_points.base)
     }
 
     /// Calculate params. This should be called only after all promise results are fulfilled.
@@ -442,21 +442,24 @@ where
 }
 
 // TODO: Maybe change?
-// impl<
-//         F: Field,
-//         C: CoreBuilder<F, CircuitBuilder = ShaCircuitBuilder<F, ShaFlexGateManager<F>>>,
-//         P: PromiseBuilder<F>,
-//     > CircuitPinningInstructions for ComponentCircuitImpl<F, C, P>
-// where
-//     <C as ComponentBuilder<F>>::Params: CoreBuilderParams,
-// {
-//     type Pinning = Eth2ConfigPinning;
-//     fn pinning(&self) -> Self::Pinning {
-//         let break_points = self.rlc_builder.borrow().break_points();
-//         let params = self.rlc_builder.borrow().params();
-//         Eth2ConfigPinning::new(params, break_points)
-//     }
-// }
+impl<
+        F: Field,
+        C: CoreBuilder<F, CircuitBuilder = ShaCircuitBuilder<F, ShaFlexGateManager<F>>>,
+        P: PromiseBuilder<F>,
+    > CircuitPinningInstructions for ComponentCircuitImpl<F, C, P>
+where
+    <C as ComponentBuilder<F>>::Params: CoreBuilderParams,
+{
+    type Pinning = RlcCircuitPinning;
+    fn pinning(&self) -> Self::Pinning {
+        let break_points = self.rlc_builder.borrow().break_points();
+        let params = self.rlc_builder.borrow().params();
+        RlcCircuitPinning::new(
+            RlcCircuitParams { base: params, num_rlc_columns: 0 },
+            RlcThreadBreakPoints { base: break_points, rlc: vec![] },
+        )
+    }
+}
 
 impl<
         F: Field,
