@@ -16,7 +16,7 @@ use axiom_eth::{
     utils::{
         build_utils::{
             aggregation::CircuitMetadata,
-            pinning::{CircuitPinningInstructions, Halo2CircuitPinning, RlcCircuitPinning},
+            pinning::{BaseCircuitPinning, CircuitPinningInstructions, Halo2CircuitPinning, RlcCircuitPinning},
         },
         component::{
             circuit::{
@@ -167,6 +167,7 @@ where
 
         let CoreBuilderOutput { public_instances: other_pis, virtual_table: vt, .. } = core_builder
             .virtual_assign_phase0(rlc_builder, PromiseCaller::new(self.promise_collector.clone()));
+        // println!("[circ] vt: {:?}", vt.iter().flat_map(|v| v.0.fields.iter().map(|e| e.value()).chain(v.1.fields.iter().map(|e| e.value())).collect_vec()).collect_vec());
         let output_commit =
             <<C as CoreBuilder<F>>::CompType as ComponentType<F>>::Commiter::compute_commitment(
                 rlc_builder.base_mut(),
@@ -371,7 +372,7 @@ where
         let promise_config = P::configure_with_params(meta, params.1);
         // This is really tricky..
         let usable_rows = (1 << k) - meta.minimum_rows();
-        // rlc_config.set_usable_rows(usable_rows);
+        rlc_config.base.set_usable_rows(usable_rows);
         (core_config, promise_config, rlc_config)
     }
 
@@ -388,7 +389,7 @@ where
         if !self.rlc_builder.borrow().base().core().use_unknown() {
             self.promise_collector.lock().unwrap().set_promise_results_ready(true);
         }
-        config.2.base.initialize(&mut layouter);
+        // config.2.base.initialize(&mut layouter);
         self.virtual_assign_phase0()?;
         {
             let mut core_builder = self.core_builder.borrow_mut();

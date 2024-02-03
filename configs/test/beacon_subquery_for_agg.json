@@ -1,0 +1,38 @@
+{
+  "params": {
+    "base": {
+      "k": 20,
+      "num_advice_per_phase": [
+        13
+      ],
+      "num_fixed": 1,
+      "num_lookup_advice_per_phase": [
+        2,
+        0,
+        0
+      ],
+      "lookup_bits": 19,
+      "num_instance_columns": 1
+    },
+    "num_rlc_columns": 0
+  },
+  "break_points": {
+    "base": [
+      [
+        1048566,
+        1048564,
+        1048565,
+        1048566,
+        1048565,
+        1048565,
+        1048566,
+        1048566,
+        1048566,
+        1048566,
+        1048566,
+        1048564
+      ]
+    ],
+    "rlc": []
+  }
+}

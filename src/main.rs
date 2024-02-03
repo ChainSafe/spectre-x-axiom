@@ -13,7 +13,7 @@ use axiom_codec::{
     constants::NUM_SUBQUERY_TYPES,
     types::{
         field_elements::AnySubqueryResult,
-        native::{AccountSubquery, HeaderSubquery, SubqueryType},
+        native::{AccountSubquery, HeaderSubquery, SubqueryResult, SubqueryType},
     },
 };
 use axiom_eth::{
@@ -45,6 +45,7 @@ use axiom_query::{
         dummy_rlc_circuit_params,
         results::{
             circuit::{ComponentCircuitResultsRoot, CoreParamsResultRoot},
+            table::SubqueryResultsTable,
             types::CircuitInputResultsRootShard,
         },
         subqueries::{
@@ -56,7 +57,10 @@ use axiom_query::{
                 },
                 STORAGE_ROOT_INDEX,
             },
-            block_header::{circuit::PromiseLoaderHeaderSubquery, types::OutputHeaderShard},
+            block_header::{
+                circuit::PromiseLoaderHeaderSubquery,
+                types::{ComponentTypeHeaderSubquery, OutputHeaderShard},
+            },
             common::{shard_into_component_promise_results, OutputSubqueryShard},
             storage::{
                 circuit::{ComponentCircuitStorageSubquery, CoreParamsStorageSubquery},
@@ -77,8 +81,11 @@ use ethers_core::types::{transaction::request, Address, Chain, H256};
 use ethers_providers::Middleware;
 use futures::future::join_all;
 use halo2_base::{
-    gates::circuit::CircuitBuilderStage,
-    halo2_proofs::{dev::MockProver, poly::kzg::commitment::ParamsKZG},
+    gates::circuit::{BaseCircuitParams, CircuitBuilderStage},
+    halo2_proofs::{
+        dev::MockProver,
+        poly::{commitment::Params, kzg::commitment::ParamsKZG},
+    },
     utils::fs::gen_srs,
 };
 use halo2curves::bn256::Bn256;
@@ -106,62 +113,66 @@ pub const STORAGE_PROOF_MAX_DEPTH: usize = 13;
 
 #[tokio::main]
 async fn main() {
-    // let storage_snark = {
-    //     let k = 18;
-    //     let params = gen_srs(k);
-    //     let subqueries = vec![
-    //         (17143006, "0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B", H256::zero()),
-    //         (17143000, "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45", H256::zero()),
-    //         (16356350, "0xb47e3cd837dDF8e4c57F05d70Ab865de6e193BBB", H256::zero()),
-    //         (15411056, "0x1c479675ad559DC151F6Ec7ed3FbF8ceE79582B6", H256::zero()),
-    //     ];
-    //     let circuit = get_storage_subqueries_circuit(k, Chain::Mainnet, subqueries).await;
-    //     let (pk, pinning) = circuit
-    //         .create_pk(&params, "./data/storage_4_18.pkey", "./config/storage_4_18.json")
-    //         .unwrap();
-    //     gen_snark_shplonk(&params, &pk, circuit, Some("./data/storage_4_18.proof"))
-    // };
-
-    const K: u32 = 19;
-    let params = gen_srs(K);
-
+    const AGG_K: u32 = 19;
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let header_params = gen_srs(20);
 
-    let (header_snark, promise_results) = generate_header_snark(&params).await.unwrap();
-    let keccak_commit =
-        promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
+    let mut subquery_results = vec![];
+    let (header_snark, mut promise_results) =
+        generate_header_snark(&header_params, &mut subquery_results).await.unwrap();
+    // let keccak_commit =
+    //     promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
 
-    let results_input: CircuitInputResultsRootShard<Fr> = serde_json::from_reader(
-        File::open(format!("{cargo_manifest_dir}/data/test/input_results_root_for_agg.json"))
-            .unwrap(),
-    )
-    .unwrap();
+    let results_input = CircuitInputResultsRootShard::<Fr> {
+        subqueries: SubqueryResultsTable::<Fr>::new(
+            subquery_results.clone().into_iter().map(|r| r.try_into().unwrap()).collect_vec(),
+        ),
+        num_subqueries: Fr::from(subquery_results.len() as u64),
+    };
 
-    let result_rlc_pinning: RlcCircuitPinning = serde_json::from_reader(
-        File::open(format!("{cargo_manifest_dir}/configs/test/results_root_for_agg.json")).unwrap(),
-    )
-    .unwrap();
+    let results_circuit_k = AGG_K;
+    let result_rlc_params = dummy_rlc_circuit_params(results_circuit_k as usize);
 
     let mut enabled_types = [false; NUM_SUBQUERY_TYPES];
     enabled_types[SubqueryType::Header as usize] = true;
-    let mut params_per_comp = HashMap::new();
-    params_per_comp.insert(
-        ComponentTypeBeaconSubquery::<Fr>::get_type_id(),
-        SingleComponentLoaderParams::new(0, vec![3]), // what is shard_caps?
-    );
-    let promise_results_params = MultiPromiseLoaderParams { params_per_component: params_per_comp };
+
+    let promise_results_params = {
+        let mut params_per_comp = HashMap::new();
+        params_per_comp.insert(
+            ComponentTypeHeaderSubquery::<Fr>::get_type_id(), // we keep using ComponentTypeHeaderSubquery so we don't need to modify Results circuit
+            SingleComponentLoaderParams::new(0, vec![1]),     // what is shard_caps?
+        );
+
+        MultiPromiseLoaderParams { params_per_component: params_per_comp }
+    };
 
     let mut results_circuit = ComponentCircuitResultsRoot::<Fr>::new(
         CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
         (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
-        result_rlc_pinning.params,
+        result_rlc_params,
     );
     results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
+
+    let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
+        generate_keccak_shards_from_calls(&results_circuit, 200).unwrap().into_logical_results(),
+    );
+    promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
+
+    let keccak_commit =
+        promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
+
+
     results_circuit.fulfill_promise_results(&promise_results).unwrap();
     results_circuit.calculate_params();
 
+    // let instances = results_circuit.instances();
+    // println!("results_snark_mock: {:?}", instances);
+    // MockProver::run(results_circuit_k as u32, &results_circuit, instances).unwrap().assert_satisfied();
+
+    let rslt_params = gen_srs(results_circuit_k);
+
     let results_snark =
-        generate_snark("results_root_for_agg", &params, results_circuit, &|pinning| {
+        generate_snark("results_root_for_agg", &rslt_params, results_circuit, &|pinning| {
             let results_circuit = ComponentCircuitResultsRoot::<Fr>::prover(
                 CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
                 (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
@@ -184,27 +195,30 @@ async fn main() {
         promise_commit_keccak: keccak_commit,
     };
 
+    let agg_params = rslt_params;
+
     let mut agg_circuit = aggregation_payload
         .build(
             CircuitBuilderStage::Mock,
             AggregationCircuitParams {
-                degree: K,
+                degree: AGG_K,
                 num_advice: 0,
                 num_lookup_advice: 0,
                 num_fixed: 0,
                 lookup_bits: 8,
             },
             //rlc_circuit_params.base.try_into().unwrap(),
-            &params,
+            &agg_params,
         )
         .unwrap();
     agg_circuit.calculate_params(Some(9));
     let instances = agg_circuit.instances();
-    MockProver::run(K, &agg_circuit, instances).unwrap().assert_satisfied();
+    MockProver::run(AGG_K, &agg_circuit, instances).unwrap().assert_satisfied();
 }
 
 async fn generate_header_snark(
     params: &ParamsKZG<Bn256>,
+    subquery_results: &mut Vec<SubqueryResult>,
 ) -> anyhow::Result<(EnhancedSnark, GroupedPromiseResults<Fr>)> {
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
 
@@ -213,14 +227,22 @@ async fn generate_header_snark(
     // ))?)?;
 
     let client = beacon_api_client::mainnet::Client::new(
-        Url::parse("https://lodestar-sepolia.chainsafe.io").unwrap(),
+        Url::parse("https://lodestar-holesky.chainsafe.io").unwrap(),
     );
 
-    let beacon_input = fetch_beacon_args(&client).await.unwrap();
-    // write beacon_input to file /data/test/promise_results_keccak_for_agg.json
-    let beacon_input_file =
-        File::create(format!("{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"))?;
-    serde_json::to_writer(beacon_input_file, &beacon_input)?;
+    // let beacon_input = fetch_beacon_args(&client).await.unwrap();
+    // // write beacon_input to file /data/test/promise_results_keccak_for_agg.json
+    // let beacon_input_file =
+    //     File::create(format!("{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"))?;
+    // serde_json::to_writer(beacon_input_file, &beacon_input)?;
+
+    let beacon_input: CircuitInputBeaconShard = serde_json::from_reader(File::open(format!(
+        "{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"
+    ))?)?;
+    subquery_results.push(SubqueryResult {
+        subquery: beacon_input.request.clone().into(),
+        value: H256::from_slice(beacon_input.exec_payload.state_root.as_ref()).0.into(),
+    });
 
     let mut promise_results = HashMap::new();
 
@@ -229,11 +251,16 @@ async fn generate_header_snark(
     //         .unwrap(),
     // )?;
 
-    // WHY have header promise for header subquery?
     // let promise_header: OutputSubqueryShard<HeaderSubquery, H256> = serde_json::from_reader(
     //     File::open(format!("{cargo_manifest_dir}/data/test/promise_results_header_for_agg.json"))
     //         .unwrap(),
     // )?;
+
+    // let promise_keccak = OutputKeccakShard { responses: vec![], capacity: 1 };
+    // let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
+    //     promise_keccak.into_logical_results(),
+    // );
+    // promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
 
     let promise_header = OutputSubqueryShard::<HeaderSubquery, H256> {
         results: vec![AnySubqueryResult {
@@ -249,39 +276,37 @@ async fn generate_header_snark(
         }],
     };
 
-    // Write promise_header to file /data/test/promise_results_header_for_agg.json
-    {
-        let promise_header_file = File::create(format!(
-            "{cargo_manifest_dir}/data/test/promise_results_header_for_agg.json"
-        ))?;
-        serde_json::to_writer(promise_header_file, &promise_header)?;
-    }
-
-    // let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
-    //     promise_keccak.into_logical_results(),
-    // );
-    // promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
+    // WHY have header promise for header subquery?
+    // Guess: for resutls circuit
     promise_results.insert(
-        ComponentTypeBeaconSubquery::<Fr>::get_type_id(),
-        shard_into_component_promise_results::<Fr, ComponentTypeBeaconSubquery<Fr>>(
+        ComponentTypeHeaderSubquery::<Fr>::get_type_id(),
+        shard_into_component_promise_results::<Fr, ComponentTypeHeaderSubquery<Fr>>(
             promise_header.convert_into(),
         ),
     );
 
-    let (header_core_params, header_promise_params, header_base_params) = read_beacon_pinning()?;
-    let beacon_circuit = ComponentCircuitBeaconSubquery::<Fr>::new(
-        header_core_params.clone(),
-        header_promise_params.clone(),
-        header_base_params.params,
+    // let (header_core_params, header_promise_params, header_base_params) = read_beacon_pinning()?;
+    let circuit_params = BaseCircuitParams {
+        k: params.k() as usize,
+        lookup_bits: Some(params.k() as usize - 1),
+        num_instance_columns: 1,
+        ..Default::default()
+    };
+
+    let mut beacon_circuit = ComponentCircuitBeaconSubquery::<Fr>::new(
+        CoreParamsBeaconSubquery { capacity: 1 },
+        (),
+        circuit_params,
     );
     beacon_circuit.feed_input(Box::new(beacon_input.clone())).unwrap();
+    beacon_circuit.calculate_params();
     beacon_circuit.fulfill_promise_results(&promise_results).unwrap();
 
     let header_snark =
         generate_snark("beacon_subquery_for_agg", params, beacon_circuit, &|pinning| {
             let circuit = ComponentCircuitBeaconSubquery::<Fr>::prover(
-                header_core_params.clone(),
-                header_promise_params.clone(),
+                CoreParamsBeaconSubquery { capacity: 1 },
+                (),
                 pinning,
             );
             circuit.feed_input(Box::new(beacon_input.clone())).unwrap();
@@ -289,6 +314,134 @@ async fn generate_header_snark(
             circuit
         })?;
     Ok((header_snark, promise_results))
+}
+
+// #[test]
+// fn test_mock_subquery_agg() -> anyhow::Result<()> {
+//     let k = 19;
+//     let params = gen_srs(k as u32);
+
+//     let input = get_test_input(&params)?;
+//     let mut agg_circuit = input.build(
+//         CircuitBuilderStage::Mock,
+//         AggregationCircuitParams {
+//             degree: k as u32,
+//             num_advice: 0,
+//             num_lookup_advice: 0,
+//             num_fixed: 0,
+//             lookup_bits: 8,
+//         },
+//         //rlc_circuit_params.base.try_into().unwrap(),
+//         &params,
+//     )?;
+//     agg_circuit.calculate_params(Some(9));
+//     let instances = agg_circuit.instances();
+//     MockProver::run(k as u32, &agg_circuit, instances).unwrap().assert_satisfied();
+//     Ok(())
+// }
+
+fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
+    name: &'static str,
+    params: &ParamsKZG<Bn256>,
+    keygen_circuit: C,
+    load_prover_circuit: &impl Fn(RlcCircuitPinning) -> C,
+) -> anyhow::Result<EnhancedSnark> {
+    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let pinning_path = format!("{cargo_manifest_dir}/configs/test/{name}.json");
+    let pk_path = format!("{cargo_manifest_dir}/data/test/{name}.pk");
+    let (pk, pinning) = keygen_circuit.create_pk(params, pk_path, pinning_path)?;
+    let vk = pk.get_vk();
+    let mut vk_file = File::create(format!("data/test/{name}.vk"))?;
+    vk.write(&mut vk_file, axiom_eth::halo2_proofs::SerdeFormat::RawBytes)?;
+    let mut vk_file = File::create(format!("data/test/{name}.vk.txt"))?;
+    write!(vk_file, "{:?}", vk.pinned())?;
+
+    let component_circuit = load_prover_circuit(pinning);
+
+    let snark_path = format!("data/test/{name}.snark");
+    let snark = gen_snark_shplonk(params, &pk, component_circuit, Some(snark_path));
+    Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
+}
+
+// Fetches the latest `LightClientFinalityUpdate`` and the current sync committee (from LightClientBootstrap) and converts it to a [`SyncStepArgs`] witness.
+pub async fn fetch_beacon_args<C: ClientTypes>(
+    client: &Client<C>,
+) -> anyhow::Result<CircuitInputBeaconShard> {
+    let mut finality_update = get_light_client_finality_update(client).await.unwrap();
+    let block_root = client
+        .get_beacon_block_root(BlockId::Slot(finality_update.finalized_header.beacon.slot))
+        .await
+        .unwrap();
+    let bootstrap = get_light_client_bootstrap::<Mainnet, _>(client, block_root).await.unwrap();
+
+    let pubkeys_compressed = bootstrap.current_sync_committee.pubkeys;
+
+    let attested_state_id = finality_update.attested_header.beacon.state_root;
+
+    let fork_version = client.get_fork(StateId::Root(attested_state_id)).await?.current_version;
+    let genesis_validators_root = client.get_genesis_details().await?.genesis_validators_root;
+    let fork_data = ForkData { genesis_validators_root, fork_version };
+    let domain = compute_domain(DomainType::SyncCommittee, &fork_data)?;
+
+    let step_args =
+        step_args_from_finality_update(finality_update.clone(), pubkeys_compressed, domain)
+            .await
+            .unwrap();
+
+    let request = HeaderSubquery {
+        block_number: finality_update.finalized_header.execution.block_number as u32,
+        field_idx: EXEC_STATE_ROOT_INDEX as u32,
+    };
+
+    let exec_block_num_branch =
+        beacon_header_proof(&mut finality_update.finalized_header.execution, EXEC_BLOCK_NUM_GINDEX)
+            .into_iter()
+            .map(|node| node.as_ref().to_vec())
+            .collect::<Vec<_>>();
+
+    let exec_payload_field_branch = beacon_header_proof(
+        &mut finality_update.finalized_header.execution,
+        EXEC_PAYLOAD_FIELD_GINDECES[EXEC_STATE_ROOT_INDEX],
+    )
+    .into_iter()
+    .map(|node| node.as_ref().to_vec())
+    .collect::<Vec<_>>();
+
+    Ok(CircuitInputBeaconShard {
+        request,
+        step_args,
+        exec_block_num_branch,
+        exec_payload_field_branch,
+        exec_payload: finality_update.finalized_header.execution,
+    })
+}
+
+pub fn beacon_header_proof(
+    header: &mut ExecutionPayloadHeader<BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES>,
+    gindex: usize,
+) -> Vec<Node> {
+    let header_leaves = [
+        header.parent_hash.hash_tree_root().unwrap(),
+        header.fee_recipient.hash_tree_root().unwrap(),
+        header.state_root.hash_tree_root().unwrap(),
+        header.receipts_root.hash_tree_root().unwrap(),
+        header.logs_bloom.hash_tree_root().unwrap(),
+        header.prev_randao.hash_tree_root().unwrap(),
+        header.block_number.hash_tree_root().unwrap(),
+        header.gas_limit.hash_tree_root().unwrap(),
+        header.gas_used.hash_tree_root().unwrap(),
+        header.timestamp.hash_tree_root().unwrap(),
+        header.extra_data.hash_tree_root().unwrap(),
+        header.base_fee_per_gas.hash_tree_root().unwrap(),
+        header.block_hash.hash_tree_root().unwrap(),
+        header.transactions_root.hash_tree_root().unwrap(),
+        header.withdrawals_root.hash_tree_root().unwrap(),
+    ];
+    let merkle_tree = merkle_tree(&header_leaves);
+    let helper_indices = get_helper_indices(&[gindex]);
+    let proof = helper_indices.iter().copied().map(|i| merkle_tree[i]).collect::<Vec<_>>();
+    assert_eq!(proof.len(), helper_indices.len());
+    proof
 }
 
 async fn generate_account_snark(
@@ -472,148 +625,4 @@ async fn generate_storage_snark(
     circuit.fulfill_promise_results(&promises).unwrap();
 
     circuit
-}
-
-fn read_beacon_pinning(
-) -> anyhow::Result<(CoreParamsBeaconSubquery, PromiseLoaderParams, BaseCircuitPinning)> {
-    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let header_core_params: CoreParamsBeaconSubquery = serde_json::from_reader(File::open(
-        format!("{cargo_manifest_dir}/configs/test/beacon_subquery_core_params.json"),
-    )?)?;
-    let header_promise_params: <PromiseLoaderHeaderSubquery<Fr> as ComponentBuilder<Fr>>::Params =
-        serde_json::from_reader(File::open(format!(
-            "{cargo_manifest_dir}/configs/test/header_subquery_loader_params.json"
-        ))?)?;
-    let header_rlc_params: BaseCircuitPinning = serde_json::from_reader(File::open(format!(
-        "{cargo_manifest_dir}/configs/test/beacon_subquery.json"
-    ))?)?;
-    Ok((header_core_params, header_promise_params, header_rlc_params))
-}
-
-// #[test]
-// fn test_mock_subquery_agg() -> anyhow::Result<()> {
-//     let k = 19;
-//     let params = gen_srs(k as u32);
-
-//     let input = get_test_input(&params)?;
-//     let mut agg_circuit = input.build(
-//         CircuitBuilderStage::Mock,
-//         AggregationCircuitParams {
-//             degree: k as u32,
-//             num_advice: 0,
-//             num_lookup_advice: 0,
-//             num_fixed: 0,
-//             lookup_bits: 8,
-//         },
-//         //rlc_circuit_params.base.try_into().unwrap(),
-//         &params,
-//     )?;
-//     agg_circuit.calculate_params(Some(9));
-//     let instances = agg_circuit.instances();
-//     MockProver::run(k as u32, &agg_circuit, instances).unwrap().assert_satisfied();
-//     Ok(())
-// }
-
-fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
-    name: &'static str,
-    params: &ParamsKZG<Bn256>,
-    keygen_circuit: C,
-    load_prover_circuit: &impl Fn(RlcCircuitPinning) -> C,
-) -> anyhow::Result<EnhancedSnark> {
-    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let pinning_path = format!("{cargo_manifest_dir}/configs/test/{name}.json");
-    let pk_path = format!("{cargo_manifest_dir}/data/test/{name}.pk");
-    let (pk, pinning) = keygen_circuit.create_pk(params, pk_path, pinning_path)?;
-    let vk = pk.get_vk();
-    let mut vk_file = File::create(format!("data/test/{name}.vk"))?;
-    vk.write(&mut vk_file, axiom_eth::halo2_proofs::SerdeFormat::RawBytes)?;
-    let mut vk_file = File::create(format!("data/test/{name}.vk.txt"))?;
-    write!(vk_file, "{:?}", vk.pinned())?;
-
-    let component_circuit = load_prover_circuit(pinning);
-
-    let snark_path = format!("data/test/{name}.snark");
-    let snark = gen_snark_shplonk(params, &pk, component_circuit, Some(snark_path));
-    Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
-}
-
-// Fetches the latest `LightClientFinalityUpdate`` and the current sync committee (from LightClientBootstrap) and converts it to a [`SyncStepArgs`] witness.
-pub async fn fetch_beacon_args<C: ClientTypes>(
-    client: &Client<C>,
-) -> anyhow::Result<CircuitInputBeaconShard> {
-    let mut finality_update = get_light_client_finality_update(client).await.unwrap();
-    let block_root = client
-        .get_beacon_block_root(BlockId::Slot(finality_update.finalized_header.beacon.slot))
-        .await
-        .unwrap();
-    let bootstrap = get_light_client_bootstrap::<Mainnet, _>(client, block_root).await.unwrap();
-
-    let pubkeys_compressed = bootstrap.current_sync_committee.pubkeys;
-
-    let attested_state_id = finality_update.attested_header.beacon.state_root;
-
-    let fork_version = client.get_fork(StateId::Root(attested_state_id)).await?.current_version;
-    let genesis_validators_root = client.get_genesis_details().await?.genesis_validators_root;
-    let fork_data = ForkData { genesis_validators_root, fork_version };
-    let domain = compute_domain(DomainType::SyncCommittee, &fork_data)?;
-
-    let step_args =
-        step_args_from_finality_update(finality_update.clone(), pubkeys_compressed, domain)
-            .await
-            .unwrap();
-
-    let request = HeaderSubquery {
-        block_number: finality_update.finalized_header.execution.block_number as u32,
-        field_idx: EXEC_STATE_ROOT_INDEX as u32,
-    };
-
-    let exec_block_num_branch =
-        beacon_header_proof(&mut finality_update.finalized_header.execution, EXEC_BLOCK_NUM_GINDEX)
-            .into_iter()
-            .map(|node| node.as_ref().to_vec())
-            .collect::<Vec<_>>();
-
-    let exec_payload_field_branch = beacon_header_proof(
-        &mut finality_update.finalized_header.execution,
-        EXEC_PAYLOAD_FIELD_GINDECES[EXEC_STATE_ROOT_INDEX],
-    )
-    .into_iter()
-    .map(|node| node.as_ref().to_vec())
-    .collect::<Vec<_>>();
-
-    Ok(CircuitInputBeaconShard {
-        request,
-        step_args,
-        exec_block_num_branch,
-        exec_payload_field_branch,
-        exec_payload: finality_update.finalized_header.execution,
-    })
-}
-
-pub fn beacon_header_proof(
-    header: &mut ExecutionPayloadHeader<BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES>,
-    gindex: usize,
-) -> Vec<Node> {
-    let header_leaves = [
-        header.parent_hash.hash_tree_root().unwrap(),
-        header.fee_recipient.hash_tree_root().unwrap(),
-        header.state_root.hash_tree_root().unwrap(),
-        header.receipts_root.hash_tree_root().unwrap(),
-        header.logs_bloom.hash_tree_root().unwrap(),
-        header.prev_randao.hash_tree_root().unwrap(),
-        header.block_number.hash_tree_root().unwrap(),
-        header.gas_limit.hash_tree_root().unwrap(),
-        header.gas_used.hash_tree_root().unwrap(),
-        header.timestamp.hash_tree_root().unwrap(),
-        header.extra_data.hash_tree_root().unwrap(),
-        header.base_fee_per_gas.hash_tree_root().unwrap(),
-        header.block_hash.hash_tree_root().unwrap(),
-        header.transactions_root.hash_tree_root().unwrap(),
-        header.withdrawals_root.hash_tree_root().unwrap(),
-    ];
-    let merkle_tree = merkle_tree(&header_leaves);
-    let helper_indices = get_helper_indices(&[gindex]);
-    let proof = helper_indices.iter().copied().map(|i| merkle_tree[i]).collect::<Vec<_>>();
-    assert_eq!(proof.len(), helper_indices.len());
-    proof
 }
