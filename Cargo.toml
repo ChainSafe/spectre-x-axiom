@@ -84,6 +84,6 @@ zkevm-hashes = { path = "../halo2-lib/hashes/zkevm" }
 
 
 [patch."https://github.com/axiom-crypto/axiom-eth"]
-axiom-eth = { version = "=0.4.0", path = "../examples/axiom-eth/axiom-eth" }
-axiom-query = { version = "=2.0.14", path = "../examples/axiom-eth/axiom-query" }
-axiom-codec = { version = "0.2.0", path = "../examples/axiom-eth/axiom-codec" }
+axiom-eth = { version = "=0.4.0", path = "../axiom-eth/axiom-eth" }
+axiom-query = { version = "=2.0.14", path = "../axiom-eth/axiom-query" }
+axiom-codec = { version = "0.2.0", path = "../axiom-eth/axiom-codec" }

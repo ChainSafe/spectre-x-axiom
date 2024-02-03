@@ -9,14 +9,12 @@ use std::{
 use anyhow::anyhow;
 use axiom_eth::{
     rlc::{
-        circuit::{builder::RlcCircuitBuilder, RlcCircuitParams, RlcConfig},
+        circuit::RlcCircuitParams,
         virtual_region::RlcThreadBreakPoints,
-    },
-    snark_verifier_sdk,
-    utils::{
+    }, snark_verifier_sdk, utils::{
         build_utils::{
             aggregation::CircuitMetadata,
-            pinning::{BaseCircuitPinning, CircuitPinningInstructions, Halo2CircuitPinning, RlcCircuitPinning},
+            pinning::{CircuitPinningInstructions, Halo2CircuitPinning, RlcCircuitPinning},
         },
         component::{
             circuit::{
@@ -29,20 +27,18 @@ use axiom_eth::{
             ComponentCircuit, ComponentPromiseResultsInMerkle, ComponentType, ComponentTypeId,
             GroupedPromiseCalls, GroupedPromiseResults, LogicalInputValue, PromiseShardMetadata,
         },
-        DEFAULT_RLC_CACHE_BITS,
-    },
+    }
 };
 use halo2_base::{
     gates::{
         circuit::{BaseCircuitParams, CircuitBuilderStage},
-        flex_gate::{MultiPhaseThreadBreakPoints, ThreadBreakPoints},
+        flex_gate::MultiPhaseThreadBreakPoints,
         GateChip,
     },
     halo2_proofs::{
         circuit::{Layouter, SimpleFloorPlanner},
         plonk::{Circuit, ConstraintSystem, Error},
     },
-    virtual_region::manager::VirtualRegionManager,
     AssignedValue,
 };
 use itertools::Itertools;
@@ -399,7 +395,7 @@ where
             let mut phase0_layouter = layouter.namespace(|| "raw synthesize phase0");
             core_builder.borrow_mut().raw_synthesize_phase0(&config.0, &mut phase0_layouter);
             promise_builder.raw_synthesize_phase0(&config.1, &mut phase0_layouter);
-            rlc_builder.synthesize(config.2.clone(), phase0_layouter);
+            rlc_builder.synthesize(config.2.clone(), phase0_layouter).unwrap();
         }
         #[cfg(feature = "halo2-axiom")]
         {

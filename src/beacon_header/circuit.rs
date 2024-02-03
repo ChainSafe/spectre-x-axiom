@@ -4,35 +4,22 @@
 //! Shard:
 //! - Step
 
-use axiom_codec::{
-    types::{field_elements::FieldHeaderSubquery, native::HeaderSubquery},
-    HiLo,
-};
+use std::marker::PhantomData;
+
+use axiom_codec::{types::field_elements::FieldHeaderSubquery, HiLo};
 use axiom_eth::{
     utils::{
-        build_utils::{aggregation::CircuitMetadata, dummy::DummyFrom},
+        build_utils::aggregation::CircuitMetadata,
         bytes_be_to_u128,
         component::{
-            circuit::{
-                ComponentBuilder, CoreBuilder, CoreBuilderOutput, CoreBuilderOutputParams,
-                CoreBuilderParams,
-            },
+            circuit::{ComponentBuilder, CoreBuilder, CoreBuilderOutput},
             promise_collector::PromiseCaller,
             promise_loader::empty::EmptyPromiseLoader,
-            types::{FixLenLogical, Flatten, LogicalEmpty},
             utils::get_logical_value,
-            ComponentType, ComponentTypeId, LogicalResult,
+            LogicalResult,
         },
     },
     Field,
-};
-use axiom_query::components::subqueries::{
-    block_header::{circuit::PromiseLoaderHeaderSubquery, types::ComponentTypeHeaderSubquery},
-    storage::circuit::PayloadStorageSubquery,
-};
-use ethereum_consensus_types::{
-    light_client::ExecutionPayloadHeader,
-    presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES},
 };
 use halo2_base::{
     gates::flex_gate::threads::CommonCircuitBuilder, halo2_proofs::plonk::ConstraintSystem,
@@ -44,121 +31,43 @@ use lightclient_circuits::{
     gadget::crypto::{Sha256Chip, ShaCircuitBuilder, ShaFlexGateManager},
     ssz_merkle::verify_merkle_proof,
     sync_step_circuit::StepCircuit,
-    witness::SyncStepArgs,
 };
 use lightclient_circuits::{gadget::to_bytes_le, util::IntoWitness};
-use serde::{Deserialize, Serialize};
-use spectre_eth_types::{Mainnet, LIMB_BITS, NUM_LIMBS};
-use std::marker::PhantomData;
+use spectre_eth_types::{LIMB_BITS, NUM_LIMBS};
 
-use crate::comp_circuit_impl::ComponentCircuitImpl;
+use crate::{
+    beacon_header::types::{
+        CircuitInputBeaconShard, ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery,
+        LogicalPublicInstanceBeacon,
+    },
+    utils::ComponentCircuitImpl,
+};
+
+use super::{EXEC_BLOCK_NUM_GINDEX, EXEC_PAYLOAD_FIELD_GINDECES};
 
 pub type ComponentCircuitBeaconSubquery<F> =
     ComponentCircuitImpl<F, CoreBuilderBeaconSubquery<F>, EmptyPromiseLoader<F>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CircuitInputBeaconShard {
-    pub request: HeaderSubquery,
-
-    pub step_args: SyncStepArgs<Mainnet>,
-    pub exec_block_num_branch: Vec<Vec<u8>>,
-
-    pub exec_payload_field_branch: Vec<Vec<u8>>,
-    pub exec_payload: ExecutionPayloadHeader<BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES>,
-}
-
-impl Default for CircuitInputBeaconShard {
-    fn default() -> Self {
-        todo!();
-    }
-}
-
-pub const EXEC_BLOCK_NUM_GINDEX: usize = 22; // TODO;
-
-// gindex stateRoot 18n
-// gindex receiptsRoot 19n
-// gindex blockNumber 22n
-// gindex transactionsRoot 29n
-pub const EXEC_PAYLOAD_FIELD_GINDECES: [usize; 4] = [18, 19, 22, 29]; // TODO;
-
-pub const EXEC_STATE_ROOT_INDEX: usize = 0;
-
-pub struct ComponentTypeBeaconSubquery<F: Field>(PhantomData<F>);
-
-pub const BITS_PER_FE_BEACON: [usize; 2] = [32, 32];
-
-impl<F: Field> ComponentType<F> for ComponentTypeBeaconSubquery<F> {
-    type InputValue = FieldHeaderSubquery<F>;
-    type InputWitness = FieldHeaderSubquery<AssignedValue<F>>;
-    type OutputValue = HiLo<F>;
-    type OutputWitness = HiLo<AssignedValue<F>>;
-    type LogicalInput = FieldHeaderSubquery<F>;
-
-    fn get_type_id() -> ComponentTypeId {
-        // "spectre:BeaconSubquery".to_string()
-
-        // use same subquery type id to be remain compatible with Results and SubqueryAggregation circuits
-        // that have this id hard wired into constraints
-        ComponentTypeHeaderSubquery::<F>::get_type_id()
-    }
-
-    fn logical_result_to_virtual_rows_impl(
-        ins: &LogicalResult<F, Self>,
-    ) -> Vec<(Self::InputValue, Self::OutputValue)> {
-        vec![(ins.input, ins.output)]
-    }
-    fn logical_input_to_virtual_rows_impl(li: &Self::LogicalInput) -> Vec<Self::InputValue> {
-        vec![*li]
-    }
-}
-
-/// Specify the output format of BeaconSubquery component.
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub struct CoreParamsBeaconSubquery {
-    /// The maximum number of subqueries of this type allowed in a single circuit.
-    pub capacity: usize,
-}
-
-impl CoreBuilderParams for CoreParamsBeaconSubquery {
-    fn get_output_params(&self) -> CoreBuilderOutputParams {
-        CoreBuilderOutputParams::new(vec![self.capacity])
-    }
-}
-
 pub struct CoreBuilderBeaconSubquery<F: Field> {
     input: Option<CircuitInputBeaconShard>,
     params: CoreParamsBeaconSubquery,
-    payload: Option<Vec<PayloadStorageSubquery<F>>>,
+    _f: PhantomData<F>,
 }
 
 impl<F: Field> ComponentBuilder<F> for CoreBuilderBeaconSubquery<F> {
     type Params = CoreParamsBeaconSubquery;
 
     fn new(params: Self::Params) -> Self {
-        Self { input: None, params, payload: None }
+        Self { input: None, params, _f: PhantomData }
     }
     fn get_params(&self) -> Self::Params {
         self.params.clone()
     }
-    fn clear_witnesses(&mut self) {
-        self.payload = None;
-    }
+    fn clear_witnesses(&mut self) {}
     fn calculate_params(&mut self) -> Self::Params {
         self.params.clone()
     }
     fn configure_with_params(_: &mut ConstraintSystem<F>, _: Self::Params) {}
-}
-
-impl DummyFrom<CoreParamsBeaconSubquery> for CircuitInputBeaconShard {
-    fn dummy_from(core_params: CoreParamsBeaconSubquery) -> Self {
-        Default::default()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogicalPublicInstanceBeacon<T: Copy> {
-    pub pub_inputs_commit: T,
-    pub poseidon_commit: T,
 }
 
 impl<F: Field> CircuitMetadata for CoreBuilderBeaconSubquery<F> {
@@ -268,42 +177,5 @@ impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
                 get_logical_value(&execution_payload_field_hilo),
             )],
         }
-    }
-}
-
-impl<T: Copy> TryFrom<Vec<T>> for LogicalPublicInstanceBeacon<T> {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Vec<T>) -> Result<Self, Self::Error> {
-        if value.len() != BITS_PER_PUBLIC_INSTANCE.len() {
-            return Err(anyhow::anyhow!("incorrect length"));
-        }
-        Ok(Self { pub_inputs_commit: value[0], poseidon_commit: value[1] })
-    }
-}
-
-const BITS_PER_PUBLIC_INSTANCE: [usize; 2] = [32, 32];
-
-impl<T: Copy> TryFrom<Flatten<T>> for LogicalPublicInstanceBeacon<T> {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Flatten<T>) -> Result<Self, Self::Error> {
-        if value.field_size != BITS_PER_PUBLIC_INSTANCE {
-            return Err(anyhow::anyhow!("invalid field size"));
-        }
-        value.fields.try_into()
-    }
-}
-impl<T: Copy> From<LogicalPublicInstanceBeacon<T>> for Flatten<T> {
-    fn from(val: LogicalPublicInstanceBeacon<T>) -> Self {
-        Flatten {
-            fields: vec![val.pub_inputs_commit, val.poseidon_commit],
-            field_size: &BITS_PER_PUBLIC_INSTANCE,
-        }
-    }
-}
-impl<T: Copy> FixLenLogical<T> for LogicalPublicInstanceBeacon<T> {
-    fn get_field_size() -> &'static [usize] {
-        &BITS_PER_PUBLIC_INSTANCE
     }
 }

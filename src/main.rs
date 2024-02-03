@@ -2,10 +2,11 @@
 #![feature(associated_type_defaults)]
 #![feature(associated_type_bounds)]
 #![feature(generic_const_exprs)]
-#![warn(clippy::useless_conversion)]
+#![allow(incomplete_features)]
 
-mod comp_circuit_impl;
-mod spectre_component;
+mod beacon_header;
+mod utils;
+mod witness;
 
 use std::{collections::HashMap, fs::File, marker::PhantomData, str::FromStr};
 
@@ -18,18 +19,12 @@ use axiom_codec::{
 };
 use axiom_eth::{
     halo2_proofs::halo2curves::bn256::Fr,
-    keccak::{
-        promise::generate_keccak_shards_from_calls,
-        types::{ComponentTypeKeccak, OutputKeccakShard},
-    },
-    mpt::KECCAK_RLP_EMPTY_STRING,
+    keccak::{promise::generate_keccak_shards_from_calls, types::ComponentTypeKeccak},
     providers::{setup_provider, storage::json_to_mpt_input},
     snark_verifier_sdk::{halo2::gen_snark_shplonk, CircuitExt},
     utils::{
-        build_utils::pinning::{BaseCircuitPinning, PinnableCircuit, RlcCircuitPinning},
+        build_utils::pinning::{PinnableCircuit, RlcCircuitPinning},
         component::{
-            circuit::ComponentBuilder,
-            param,
             promise_loader::{
                 comp_loader::SingleComponentLoaderParams, multi::MultiPromiseLoaderParams,
                 single::PromiseLoaderParams,
@@ -57,10 +52,7 @@ use axiom_query::{
                 },
                 STORAGE_ROOT_INDEX,
             },
-            block_header::{
-                circuit::PromiseLoaderHeaderSubquery,
-                types::{ComponentTypeHeaderSubquery, OutputHeaderShard},
-            },
+            block_header::types::ComponentTypeHeaderSubquery,
             common::{shard_into_component_promise_results, OutputSubqueryShard},
             storage::{
                 circuit::{ComponentCircuitStorageSubquery, CoreParamsStorageSubquery},
@@ -70,14 +62,13 @@ use axiom_query::{
     },
     subquery_aggregation::types::InputSubqueryAggregation,
 };
-use beacon_api_client::{BlockId, Client, ClientTypes, StateId};
-use ethereum_consensus_types::{
-    light_client::ExecutionPayloadHeader,
-    presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES},
-    signing::{compute_domain, DomainType},
-    ForkData, LightClientBootstrap,
+use beacon_header::{
+    circuit::ComponentCircuitBeaconSubquery, types::{
+        ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery,
+        OutputBeaconShard,
+    }, EXEC_STATE_ROOT_INDEX
 };
-use ethers_core::types::{transaction::request, Address, Chain, H256};
+use ethers_core::types::{Address, Chain, H256};
 use ethers_providers::Middleware;
 use futures::future::join_all;
 use halo2_base::{
@@ -90,21 +81,7 @@ use halo2_base::{
 };
 use halo2curves::bn256::Bn256;
 use itertools::Itertools;
-use lightclient_circuits::{
-    sync_step_circuit::StepCircuit,
-    util::{AppCircuit, Eth2ConfigPinning},
-    witness::{get_helper_indices, merkle_tree},
-};
-use spectre_component::{
-    CircuitInputBeaconShard, ComponentCircuitBeaconSubquery, ComponentTypeBeaconSubquery,
-    CoreParamsBeaconSubquery, EXEC_BLOCK_NUM_GINDEX, EXEC_PAYLOAD_FIELD_GINDECES,
-    EXEC_STATE_ROOT_INDEX,
-};
-use spectre_eth_types::{Mainnet, Spec};
-use spectre_preprocessor::{
-    get_light_client_bootstrap, get_light_client_finality_update, step_args_from_finality_update,
-};
-use ssz_rs::{Merkleized, Node};
+use witness::fetch_beacon_args;
 use std::io::Write;
 use url::Url;
 
@@ -113,8 +90,9 @@ pub const STORAGE_PROOF_MAX_DEPTH: usize = 13;
 
 #[tokio::main]
 async fn main() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
     const AGG_K: u32 = 19;
-    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
     let header_params = gen_srs(20);
 
     let mut subquery_results = vec![];
@@ -160,7 +138,6 @@ async fn main() {
 
     let keccak_commit =
         promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
-
 
     results_circuit.fulfill_promise_results(&promise_results).unwrap();
     results_circuit.calculate_params();
@@ -222,23 +199,24 @@ async fn generate_header_snark(
 ) -> anyhow::Result<(EnhancedSnark, GroupedPromiseResults<Fr>)> {
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
 
-    // let beacon_input: CircuitInputBeaconShard = serde_json::from_reader(File::open(format!(
-    //     "{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"
-    // ))?)?;
-
     let client = beacon_api_client::mainnet::Client::new(
         Url::parse("https://lodestar-holesky.chainsafe.io").unwrap(),
     );
 
-    // let beacon_input = fetch_beacon_args(&client).await.unwrap();
-    // // write beacon_input to file /data/test/promise_results_keccak_for_agg.json
-    // let beacon_input_file =
-    //     File::create(format!("{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"))?;
-    // serde_json::to_writer(beacon_input_file, &beacon_input)?;
+    let beacon_input =
+        match File::open(format!("{cargo_manifest_dir}/data/test/input_beacon_for_agg.json")) {
+            Err(_) => {
+                let beacon_input = fetch_beacon_args(&client).await.unwrap();
+                // write beacon_input to file /data/test/promise_results_keccak_for_agg.json
+                let beacon_input_file = File::create(format!(
+                    "{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"
+                ))?;
+                serde_json::to_writer(beacon_input_file, &beacon_input)?;
+                beacon_input
+            }
+            Ok(file) => serde_json::from_reader(file).unwrap(),
+        };
 
-    let beacon_input: CircuitInputBeaconShard = serde_json::from_reader(File::open(format!(
-        "{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"
-    ))?)?;
     subquery_results.push(SubqueryResult {
         subquery: beacon_input.request.clone().into(),
         value: H256::from_slice(beacon_input.exec_payload.state_root.as_ref()).0.into(),
@@ -246,44 +224,36 @@ async fn generate_header_snark(
 
     let mut promise_results = HashMap::new();
 
-    // let promise_keccak: OutputKeccakShard = serde_json::from_reader(
-    //     File::open(format!("{cargo_manifest_dir}/data/test/promise_results_keccak_for_agg.json"))
-    //         .unwrap(),
-    // )?;
-
-    // let promise_header: OutputSubqueryShard<HeaderSubquery, H256> = serde_json::from_reader(
-    //     File::open(format!("{cargo_manifest_dir}/data/test/promise_results_header_for_agg.json"))
-    //         .unwrap(),
-    // )?;
-
     // let promise_keccak = OutputKeccakShard { responses: vec![], capacity: 1 };
     // let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
     //     promise_keccak.into_logical_results(),
     // );
     // promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
 
-    let promise_header = OutputSubqueryShard::<HeaderSubquery, H256> {
-        results: vec![AnySubqueryResult {
-            subquery: HeaderSubquery {
-                block_number: beacon_input.request.block_number as u32,
-                field_idx: EXEC_STATE_ROOT_INDEX as u32,
-            },
-            value: {
-                let bytes: [_; 32] =
-                    beacon_input.exec_payload.state_root.as_ref().try_into().unwrap();
-                bytes.into()
-            },
-        }],
-    };
-
     // WHY have header promise for header subquery?
     // Guess: for resutls circuit
-    promise_results.insert(
-        ComponentTypeHeaderSubquery::<Fr>::get_type_id(),
-        shard_into_component_promise_results::<Fr, ComponentTypeHeaderSubquery<Fr>>(
-            promise_header.convert_into(),
-        ),
-    );
+    {
+        let promise_header = OutputSubqueryShard::<HeaderSubquery, H256> {
+            results: vec![AnySubqueryResult {
+                subquery: HeaderSubquery {
+                    block_number: beacon_input.request.block_number as u32,
+                    field_idx: EXEC_STATE_ROOT_INDEX as u32,
+                },
+                value: {
+                    let bytes: [_; 32] =
+                        beacon_input.exec_payload.state_root.as_ref().try_into().unwrap();
+                    bytes.into()
+                },
+            }],
+        };
+
+        promise_results.insert(
+            ComponentTypeHeaderSubquery::<Fr>::get_type_id(),
+            shard_into_component_promise_results::<Fr, ComponentTypeHeaderSubquery<Fr>>(
+                promise_header.convert_into(),
+            ),
+        );
+    }
 
     // let (header_core_params, header_promise_params, header_base_params) = read_beacon_pinning()?;
     let circuit_params = BaseCircuitParams {
@@ -316,30 +286,6 @@ async fn generate_header_snark(
     Ok((header_snark, promise_results))
 }
 
-// #[test]
-// fn test_mock_subquery_agg() -> anyhow::Result<()> {
-//     let k = 19;
-//     let params = gen_srs(k as u32);
-
-//     let input = get_test_input(&params)?;
-//     let mut agg_circuit = input.build(
-//         CircuitBuilderStage::Mock,
-//         AggregationCircuitParams {
-//             degree: k as u32,
-//             num_advice: 0,
-//             num_lookup_advice: 0,
-//             num_fixed: 0,
-//             lookup_bits: 8,
-//         },
-//         //rlc_circuit_params.base.try_into().unwrap(),
-//         &params,
-//     )?;
-//     agg_circuit.calculate_params(Some(9));
-//     let instances = agg_circuit.instances();
-//     MockProver::run(k as u32, &agg_circuit, instances).unwrap().assert_satisfied();
-//     Ok(())
-// }
-
 fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
     name: &'static str,
     params: &ParamsKZG<Bn256>,
@@ -363,87 +309,6 @@ fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinnin
     Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
 }
 
-// Fetches the latest `LightClientFinalityUpdate`` and the current sync committee (from LightClientBootstrap) and converts it to a [`SyncStepArgs`] witness.
-pub async fn fetch_beacon_args<C: ClientTypes>(
-    client: &Client<C>,
-) -> anyhow::Result<CircuitInputBeaconShard> {
-    let mut finality_update = get_light_client_finality_update(client).await.unwrap();
-    let block_root = client
-        .get_beacon_block_root(BlockId::Slot(finality_update.finalized_header.beacon.slot))
-        .await
-        .unwrap();
-    let bootstrap = get_light_client_bootstrap::<Mainnet, _>(client, block_root).await.unwrap();
-
-    let pubkeys_compressed = bootstrap.current_sync_committee.pubkeys;
-
-    let attested_state_id = finality_update.attested_header.beacon.state_root;
-
-    let fork_version = client.get_fork(StateId::Root(attested_state_id)).await?.current_version;
-    let genesis_validators_root = client.get_genesis_details().await?.genesis_validators_root;
-    let fork_data = ForkData { genesis_validators_root, fork_version };
-    let domain = compute_domain(DomainType::SyncCommittee, &fork_data)?;
-
-    let step_args =
-        step_args_from_finality_update(finality_update.clone(), pubkeys_compressed, domain)
-            .await
-            .unwrap();
-
-    let request = HeaderSubquery {
-        block_number: finality_update.finalized_header.execution.block_number as u32,
-        field_idx: EXEC_STATE_ROOT_INDEX as u32,
-    };
-
-    let exec_block_num_branch =
-        beacon_header_proof(&mut finality_update.finalized_header.execution, EXEC_BLOCK_NUM_GINDEX)
-            .into_iter()
-            .map(|node| node.as_ref().to_vec())
-            .collect::<Vec<_>>();
-
-    let exec_payload_field_branch = beacon_header_proof(
-        &mut finality_update.finalized_header.execution,
-        EXEC_PAYLOAD_FIELD_GINDECES[EXEC_STATE_ROOT_INDEX],
-    )
-    .into_iter()
-    .map(|node| node.as_ref().to_vec())
-    .collect::<Vec<_>>();
-
-    Ok(CircuitInputBeaconShard {
-        request,
-        step_args,
-        exec_block_num_branch,
-        exec_payload_field_branch,
-        exec_payload: finality_update.finalized_header.execution,
-    })
-}
-
-pub fn beacon_header_proof(
-    header: &mut ExecutionPayloadHeader<BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES>,
-    gindex: usize,
-) -> Vec<Node> {
-    let header_leaves = [
-        header.parent_hash.hash_tree_root().unwrap(),
-        header.fee_recipient.hash_tree_root().unwrap(),
-        header.state_root.hash_tree_root().unwrap(),
-        header.receipts_root.hash_tree_root().unwrap(),
-        header.logs_bloom.hash_tree_root().unwrap(),
-        header.prev_randao.hash_tree_root().unwrap(),
-        header.block_number.hash_tree_root().unwrap(),
-        header.gas_limit.hash_tree_root().unwrap(),
-        header.gas_used.hash_tree_root().unwrap(),
-        header.timestamp.hash_tree_root().unwrap(),
-        header.extra_data.hash_tree_root().unwrap(),
-        header.base_fee_per_gas.hash_tree_root().unwrap(),
-        header.block_hash.hash_tree_root().unwrap(),
-        header.transactions_root.hash_tree_root().unwrap(),
-        header.withdrawals_root.hash_tree_root().unwrap(),
-    ];
-    let merkle_tree = merkle_tree(&header_leaves);
-    let helper_indices = get_helper_indices(&[gindex]);
-    let proof = helper_indices.iter().copied().map(|i| merkle_tree[i]).collect::<Vec<_>>();
-    assert_eq!(proof.len(), helper_indices.len());
-    proof
-}
-
 async fn generate_account_snark(
     k: u32,
     network: Chain,
@@ -451,7 +316,6 @@ async fn generate_account_snark(
     keccak_f_capacity: usize,
 ) -> anyhow::Result<EnhancedSnark> {
     let params = gen_srs(k);
-    let _ = env_logger::builder().is_test(true).try_init();
 
     let _provider = setup_provider(network);
     let provider = &_provider;
@@ -470,7 +334,7 @@ async fn generate_account_snark(
         }))
         .await;
 
-    let mut promise_header = OutputHeaderShard {
+    let promise_header = OutputBeaconShard {
         results: requests
             .iter()
             .map(|r| AnySubqueryResult {
@@ -558,7 +422,7 @@ async fn generate_storage_snark(
             let proof = provider.get_proof(addr, vec![slot], Some(block_num.into())).await.unwrap();
             let storage_hash = if proof.storage_hash.is_zero() {
                 // RPC provider may give zero storage hash for empty account, but the correct storage hash should be the null root = keccak256(0x80)
-                H256::from_slice(&KECCAK_RLP_EMPTY_STRING)
+                H256::from_slice(&axiom_eth::mpt::KECCAK_RLP_EMPTY_STRING)
             } else {
                 proof.storage_hash
             };
