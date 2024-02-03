@@ -1,14 +1,22 @@
 use axiom_codec::types::native::HeaderSubquery;
+use axiom_eth::block_header::STATE_ROOT_INDEX;
 use beacon_api_client::{BlockId, Client, ClientTypes, StateId};
-use ethereum_consensus_types::{light_client::ExecutionPayloadHeader, presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES}, signing::{compute_domain, DomainType}, ForkData};
+use ethereum_consensus_types::{
+    light_client::ExecutionPayloadHeader,
+    presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES},
+    signing::{compute_domain, DomainType},
+    ForkData,
+};
 use lightclient_circuits::witness::{get_helper_indices, merkle_tree};
 use spectre_eth_types::Mainnet;
-use spectre_preprocessor::{get_light_client_bootstrap, get_light_client_finality_update, step_args_from_finality_update};
+use spectre_preprocessor::{
+    get_light_client_bootstrap, get_light_client_finality_update, step_args_from_finality_update,
+};
 use ssz_rs::{Merkleized, Node};
 
-use crate::beacon_header::{types::CircuitInputBeaconShard, EXEC_BLOCK_NUM_GINDEX, EXEC_PAYLOAD_FIELD_GINDECES, EXEC_STATE_ROOT_INDEX};
-
-
+use crate::beacon_header::{
+    map_field_idx_to_payload_gindex, types::CircuitInputBeaconShard, EXEC_BLOCK_NUM_GINDEX,
+};
 
 // Fetches the latest `LightClientFinalityUpdate`` and the current sync committee (from LightClientBootstrap) and converts it to a [`SyncStepArgs`] witness.
 pub async fn fetch_beacon_args<C: ClientTypes>(
@@ -37,7 +45,7 @@ pub async fn fetch_beacon_args<C: ClientTypes>(
 
     let request = HeaderSubquery {
         block_number: finality_update.finalized_header.execution.block_number as u32,
-        field_idx: EXEC_STATE_ROOT_INDEX as u32,
+        field_idx: STATE_ROOT_INDEX as u32,
     };
 
     let exec_block_num_branch =
@@ -48,7 +56,7 @@ pub async fn fetch_beacon_args<C: ClientTypes>(
 
     let exec_payload_field_branch = beacon_header_proof(
         &mut finality_update.finalized_header.execution,
-        EXEC_PAYLOAD_FIELD_GINDECES[EXEC_STATE_ROOT_INDEX],
+        map_field_idx_to_payload_gindex(request.field_idx),
     )
     .into_iter()
     .map(|node| node.as_ref().to_vec())

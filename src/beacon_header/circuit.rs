@@ -4,10 +4,11 @@
 //! Shard:
 //! - Step
 
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData};
 
 use axiom_codec::{types::field_elements::FieldHeaderSubquery, HiLo};
 use axiom_eth::{
+    block_header::{RECEIPT_ROOT_INDEX, STATE_ROOT_INDEX, TX_ROOT_INDEX},
     utils::{
         build_utils::aggregation::CircuitMetadata,
         bytes_be_to_u128,
@@ -43,7 +44,7 @@ use crate::{
     utils::ComponentCircuitImpl,
 };
 
-use super::{EXEC_BLOCK_NUM_GINDEX, EXEC_PAYLOAD_FIELD_GINDECES};
+use super::{map_field_idx_to_payload_gindex, EXEC_BLOCK_NUM_GINDEX};
 
 pub type ComponentCircuitBeaconSubquery<F> =
     ComponentCircuitImpl<F, CoreBuilderBeaconSubquery<F>, EmptyPromiseLoader<F>>;
@@ -124,14 +125,14 @@ impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
         )
         .unwrap();
 
-        let execution_payload_fields = [
-            input.exec_payload.state_root,
-            input.exec_payload.receipts_root,
-            input.exec_payload.transactions_root,
-        ];
+        let execution_payload_fields: HashMap<_, _> = [
+            (STATE_ROOT_INDEX as u32, input.exec_payload.state_root),
+            (RECEIPT_ROOT_INDEX as u32, input.exec_payload.receipts_root),
+            (TX_ROOT_INDEX as u32, input.exec_payload.transactions_root),
+        ]
+        .into();
 
-        let execution_payload_field_bytes = execution_payload_fields
-            [input.request.field_idx as usize] // TODO: make field index dynamic
+        let execution_payload_field_bytes = execution_payload_fields[&input.request.field_idx] // TODO: make field index dynamic
             .as_ref()
             .iter()
             .map(|w| builder.main().load_witness(F::from(*w as u64)))
@@ -158,7 +159,7 @@ impl<F: Field> CoreBuilder<F> for CoreBuilderBeaconSubquery<F> {
             input.exec_payload_field_branch.iter().map(|w| w.clone().into_witness()),
             execution_payload_field_bytes.clone().into(),
             &execution_payload_root,
-            EXEC_PAYLOAD_FIELD_GINDECES[input.request.field_idx as usize],
+            map_field_idx_to_payload_gindex(input.request.field_idx),
         )
         .unwrap();
 

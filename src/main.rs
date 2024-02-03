@@ -18,11 +18,7 @@ use axiom_codec::{
     },
 };
 use axiom_eth::{
-    halo2_proofs::halo2curves::bn256::Fr,
-    keccak::{promise::generate_keccak_shards_from_calls, types::ComponentTypeKeccak},
-    providers::{setup_provider, storage::json_to_mpt_input},
-    snark_verifier_sdk::{halo2::gen_snark_shplonk, CircuitExt},
-    utils::{
+    block_header::STATE_ROOT_INDEX, halo2_proofs::halo2curves::bn256::Fr, keccak::{promise::generate_keccak_shards_from_calls, types::ComponentTypeKeccak}, providers::{setup_provider, storage::json_to_mpt_input}, snark_verifier_sdk::{halo2::gen_snark_shplonk, CircuitExt}, utils::{
         build_utils::pinning::{PinnableCircuit, RlcCircuitPinning},
         component::{
             promise_loader::{
@@ -33,7 +29,7 @@ use axiom_eth::{
             GroupedPromiseResults,
         },
         snark_verifier::{AggregationCircuitParams, EnhancedSnark},
-    },
+    }
 };
 use axiom_query::{
     components::{
@@ -63,10 +59,8 @@ use axiom_query::{
     subquery_aggregation::types::InputSubqueryAggregation,
 };
 use beacon_header::{
-    circuit::ComponentCircuitBeaconSubquery, types::{
-        ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery,
-        OutputBeaconShard,
-    }, EXEC_STATE_ROOT_INDEX
+    circuit::ComponentCircuitBeaconSubquery,
+    types::{ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery, OutputBeaconShard},
 };
 use ethers_core::types::{Address, Chain, H256};
 use ethers_providers::Middleware;
@@ -81,9 +75,9 @@ use halo2_base::{
 };
 use halo2curves::bn256::Bn256;
 use itertools::Itertools;
-use witness::fetch_beacon_args;
 use std::io::Write;
 use url::Url;
+use witness::fetch_beacon_args;
 
 pub const ACCOUNT_PROOF_MAX_DEPTH: usize = 13;
 pub const STORAGE_PROOF_MAX_DEPTH: usize = 13;
@@ -92,105 +86,59 @@ pub const STORAGE_PROOF_MAX_DEPTH: usize = 13;
 async fn main() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    const AGG_K: u32 = 19;
-    let header_params = gen_srs(20);
+    let params = gen_srs(20);
 
     let mut subquery_results = vec![];
-    let (header_snark, mut promise_results) =
-        generate_header_snark(&header_params, &mut subquery_results).await.unwrap();
+    let (snark_header, mut promise_results) =
+        generate_header_snark(&params, &mut subquery_results).await.unwrap();
     // let keccak_commit =
     //     promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
 
-    let results_input = CircuitInputResultsRootShard::<Fr> {
-        subqueries: SubqueryResultsTable::<Fr>::new(
-            subquery_results.clone().into_iter().map(|r| r.try_into().unwrap()).collect_vec(),
-        ),
-        num_subqueries: Fr::from(subquery_results.len() as u64),
-    };
+    let params = gen_srs(19);
 
-    let results_circuit_k = AGG_K;
-    let result_rlc_params = dummy_rlc_circuit_params(results_circuit_k as usize);
+    let snark_account = generate_account_snark(
+        &params,
+        Chain::Mainnet,
+        vec![(19149117, "0x0000a26b00c1F0DF003000390027140000fAa719", 0)],
+        2000,
+    )
+    .await
+    .unwrap();
 
-    let mut enabled_types = [false; NUM_SUBQUERY_TYPES];
-    enabled_types[SubqueryType::Header as usize] = true;
+    // let (snark_header, mut promise_results) =
+    //     generate_header_snark(&params, &mut subquery_results).await.unwrap();
 
-    let promise_results_params = {
-        let mut params_per_comp = HashMap::new();
-        params_per_comp.insert(
-            ComponentTypeHeaderSubquery::<Fr>::get_type_id(), // we keep using ComponentTypeHeaderSubquery so we don't need to modify Results circuit
-            SingleComponentLoaderParams::new(0, vec![1]),     // what is shard_caps?
-        );
-
-        MultiPromiseLoaderParams { params_per_component: params_per_comp }
-    };
-
-    let mut results_circuit = ComponentCircuitResultsRoot::<Fr>::new(
-        CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
-        (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
-        result_rlc_params,
-    );
-    results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
-
-    let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
-        generate_keccak_shards_from_calls(&results_circuit, 200).unwrap().into_logical_results(),
-    );
-    promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
-
-    let keccak_commit =
-        promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
-
-    results_circuit.fulfill_promise_results(&promise_results).unwrap();
-    results_circuit.calculate_params();
-
-    // let instances = results_circuit.instances();
-    // println!("results_snark_mock: {:?}", instances);
-    // MockProver::run(results_circuit_k as u32, &results_circuit, instances).unwrap().assert_satisfied();
-
-    let rslt_params = gen_srs(results_circuit_k);
-
-    let results_snark =
-        generate_snark("results_root_for_agg", &rslt_params, results_circuit, &|pinning| {
-            let results_circuit = ComponentCircuitResultsRoot::<Fr>::prover(
-                CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
-                (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
-                pinning,
-            );
-            results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
-            results_circuit.fulfill_promise_results(&promise_results).unwrap();
-            results_circuit
-        })
-        .unwrap();
+    let (snark_results_root, promise_commit_keccak) =
+        generate_results_snark(&params, promise_results, subquery_results).unwrap();
 
     let aggregation_payload = InputSubqueryAggregation {
-        snark_header: header_snark,
-        snark_results_root: results_snark,
-        snark_account: None,
+        snark_header,
+        snark_results_root,
+        snark_account: Some(snark_account),
         snark_storage: None,
         snark_solidity_mapping: None,
         snark_tx: None,
         snark_receipt: None,
-        promise_commit_keccak: keccak_commit,
+        promise_commit_keccak,
     };
-
-    let agg_params = rslt_params;
 
     let mut agg_circuit = aggregation_payload
         .build(
             CircuitBuilderStage::Mock,
             AggregationCircuitParams {
-                degree: AGG_K,
+                degree: params.k(),
                 num_advice: 0,
                 num_lookup_advice: 0,
                 num_fixed: 0,
                 lookup_bits: 8,
             },
             //rlc_circuit_params.base.try_into().unwrap(),
-            &agg_params,
+            &params,
         )
         .unwrap();
     agg_circuit.calculate_params(Some(9));
     let instances = agg_circuit.instances();
-    MockProver::run(AGG_K, &agg_circuit, instances).unwrap().assert_satisfied();
+    MockProver::run(params.k(), &agg_circuit, instances).unwrap().assert_satisfied();
 }
 
 async fn generate_header_snark(
@@ -200,18 +148,17 @@ async fn generate_header_snark(
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
 
     let client = beacon_api_client::mainnet::Client::new(
-        Url::parse("https://lodestar-holesky.chainsafe.io").unwrap(),
+        Url::parse("https://lodestar-mainnet.chainsafe.io").unwrap(),
     );
 
     let beacon_input =
         match File::open(format!("{cargo_manifest_dir}/data/test/input_beacon_for_agg.json")) {
             Err(_) => {
                 let beacon_input = fetch_beacon_args(&client).await.unwrap();
-                // write beacon_input to file /data/test/promise_results_keccak_for_agg.json
-                let beacon_input_file = File::create(format!(
+                let file = File::create(format!(
                     "{cargo_manifest_dir}/data/test/input_beacon_for_agg.json"
                 ))?;
-                serde_json::to_writer(beacon_input_file, &beacon_input)?;
+                serde_json::to_writer(file, &beacon_input)?;
                 beacon_input
             }
             Ok(file) => serde_json::from_reader(file).unwrap(),
@@ -237,7 +184,7 @@ async fn generate_header_snark(
             results: vec![AnySubqueryResult {
                 subquery: HeaderSubquery {
                     block_number: beacon_input.request.block_number as u32,
-                    field_idx: EXEC_STATE_ROOT_INDEX as u32,
+                    field_idx: STATE_ROOT_INDEX as u32,
                 },
                 value: {
                     let bytes: [_; 32] =
@@ -286,53 +233,47 @@ async fn generate_header_snark(
     Ok((header_snark, promise_results))
 }
 
-fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
-    name: &'static str,
-    params: &ParamsKZG<Bn256>,
-    keygen_circuit: C,
-    load_prover_circuit: &impl Fn(RlcCircuitPinning) -> C,
-) -> anyhow::Result<EnhancedSnark> {
-    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let pinning_path = format!("{cargo_manifest_dir}/configs/test/{name}.json");
-    let pk_path = format!("{cargo_manifest_dir}/data/test/{name}.pk");
-    let (pk, pinning) = keygen_circuit.create_pk(params, pk_path, pinning_path)?;
-    let vk = pk.get_vk();
-    let mut vk_file = File::create(format!("data/test/{name}.vk"))?;
-    vk.write(&mut vk_file, axiom_eth::halo2_proofs::SerdeFormat::RawBytes)?;
-    let mut vk_file = File::create(format!("data/test/{name}.vk.txt"))?;
-    write!(vk_file, "{:?}", vk.pinned())?;
-
-    let component_circuit = load_prover_circuit(pinning);
-
-    let snark_path = format!("data/test/{name}.snark");
-    let snark = gen_snark_shplonk(params, &pk, component_circuit, Some(snark_path));
-    Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
-}
-
 async fn generate_account_snark(
-    k: u32,
+    params: &ParamsKZG<Bn256>,
     network: Chain,
     subqueries: Vec<(u64, &str, usize)>, // (blockNum, addr, fieldIdx)
     keccak_f_capacity: usize,
 ) -> anyhow::Result<EnhancedSnark> {
-    let params = gen_srs(k);
+    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    let k = params.k();
 
     let _provider = setup_provider(network);
     let provider = &_provider;
+
     let requests =
-        join_all(subqueries.into_iter().map(|(block_num, addr, field_idx)| async move {
-            let addr = Address::from_str(addr).unwrap();
-            let block = provider.get_block(block_num).await.unwrap().unwrap();
-            let proof = provider.get_proof(addr, vec![], Some(block_num.into())).await.unwrap();
-            let mut proof = json_to_mpt_input(proof, ACCOUNT_PROOF_MAX_DEPTH, 0);
-            proof.acct_pf.root_hash = block.state_root;
-            CircuitInputAccountSubquery {
-                block_number: block_num,
-                field_idx: field_idx as u32,
-                proof,
+        match File::open(format!("{cargo_manifest_dir}/data/test/input_account_for_agg.json")) {
+            Err(_) => {
+                let results = join_all(subqueries.into_iter().map(
+                    |(block_num, addr, field_idx)| async move {
+                        let addr = Address::from_str(addr).unwrap();
+                        let block = provider.get_block(block_num).await.unwrap().unwrap();
+                        let proof =
+                            provider.get_proof(addr, vec![], Some(block_num.into())).await.unwrap();
+                        let mut proof = json_to_mpt_input(proof, ACCOUNT_PROOF_MAX_DEPTH, 0);
+                        proof.acct_pf.root_hash = block.state_root;
+                        CircuitInputAccountSubquery {
+                            block_number: block_num,
+                            field_idx: field_idx as u32,
+                            proof,
+                        }
+                    },
+                ))
+                .await;
+                let file = File::create(format!(
+                    "{cargo_manifest_dir}/data/test/input_account_for_agg.json"
+                ))?;
+                serde_json::to_writer(file, &results)?;
+
+                results
             }
-        }))
-        .await;
+            Ok(file) => serde_json::from_reader(file).unwrap(),
+        };
 
     let promise_header = OutputBeaconShard {
         results: requests
@@ -340,12 +281,14 @@ async fn generate_account_snark(
             .map(|r| AnySubqueryResult {
                 subquery: HeaderSubquery {
                     block_number: r.block_number as u32,
-                    field_idx: EXEC_STATE_ROOT_INDEX as u32, // Note: this is diffrent from `axiom_eth::block_header::STATE_ROOT_INDEX`
+                    field_idx: STATE_ROOT_INDEX as u32,
                 },
                 value: r.proof.acct_pf.root_hash,
             })
             .collect(),
     };
+
+    println!("[account] promise_header: {:?}", promise_header.results[0]);
 
     let header_capacity = promise_header.len();
 
@@ -387,7 +330,9 @@ async fn generate_account_snark(
     .collect();
     circuit.fulfill_promise_results(&promises).unwrap();
 
-    let account_snark = generate_snark("account_subquery_for_agg", &params, circuit, &|pinning| {
+    MockProver::run(k, &circuit, circuit.instances()).unwrap().assert_satisfied();
+
+    let account_snark = generate_snark("account_subquery_for_agg", params, circuit, &|pinning| {
         let circuit = ComponentCircuitAccountSubquery::<Fr>::prover(
             CoreParamsAccountSubquery {
                 capacity: requests.len(),
@@ -405,6 +350,94 @@ async fn generate_account_snark(
     })?;
 
     Ok(account_snark)
+}
+
+fn generate_results_snark(
+    params: &ParamsKZG<Bn256>,
+    mut promise_results: GroupedPromiseResults<Fr>,
+    subquery_results: Vec<SubqueryResult>,
+) -> anyhow::Result<(EnhancedSnark, Fr)> {
+    let results_input = CircuitInputResultsRootShard::<Fr> {
+        subqueries: SubqueryResultsTable::<Fr>::new(
+            subquery_results.clone().into_iter().map(|r| r.try_into().unwrap()).collect_vec(),
+        ),
+        num_subqueries: Fr::from(subquery_results.len() as u64),
+    };
+
+    let result_rlc_params = dummy_rlc_circuit_params(params.k() as usize);
+
+    let mut enabled_types = [false; NUM_SUBQUERY_TYPES];
+    enabled_types[SubqueryType::Header as usize] = true;
+
+    let promise_results_params = {
+        let mut params_per_comp = HashMap::new();
+        params_per_comp.insert(
+            ComponentTypeHeaderSubquery::<Fr>::get_type_id(), // we keep using ComponentTypeHeaderSubquery so we don't need to modify Results circuit
+            SingleComponentLoaderParams::new(0, vec![1]),     // what is shard_caps?
+        );
+
+        MultiPromiseLoaderParams { params_per_component: params_per_comp }
+    };
+
+    let mut results_circuit = ComponentCircuitResultsRoot::<Fr>::new(
+        CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
+        (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
+        result_rlc_params,
+    );
+    results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
+
+    let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
+        generate_keccak_shards_from_calls(&results_circuit, 200).unwrap().into_logical_results(),
+    );
+    promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
+
+    let keccak_commit =
+        promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
+
+    results_circuit.fulfill_promise_results(&promise_results).unwrap();
+    results_circuit.calculate_params();
+
+    // let instances = results_circuit.instances();
+    // println!("results_snark_mock: {:?}", instances);
+    // MockProver::run(results_circuit_k as u32, &results_circuit, instances).unwrap().assert_satisfied();
+
+    let results_snark =
+        generate_snark("results_root_for_agg", &params, results_circuit, &|pinning| {
+            let results_circuit = ComponentCircuitResultsRoot::<Fr>::prover(
+                CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
+                (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
+                pinning,
+            );
+            results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
+            results_circuit.fulfill_promise_results(&promise_results).unwrap();
+            results_circuit
+        })
+        .unwrap();
+
+    Ok((results_snark, keccak_commit))
+}
+
+fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
+    name: &'static str,
+    params: &ParamsKZG<Bn256>,
+    keygen_circuit: C,
+    load_prover_circuit: &impl Fn(RlcCircuitPinning) -> C,
+) -> anyhow::Result<EnhancedSnark> {
+    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let pinning_path = format!("{cargo_manifest_dir}/configs/test/{name}.json");
+    let pk_path = format!("{cargo_manifest_dir}/data/test/{name}.pk");
+    let (pk, pinning) = keygen_circuit.create_pk(params, pk_path, pinning_path)?;
+    let vk = pk.get_vk();
+    let mut vk_file = File::create(format!("data/test/{name}.vk"))?;
+    vk.write(&mut vk_file, axiom_eth::halo2_proofs::SerdeFormat::RawBytes)?;
+    let mut vk_file = File::create(format!("data/test/{name}.vk.txt"))?;
+    write!(vk_file, "{:?}", vk.pinned())?;
+
+    let component_circuit = load_prover_circuit(pinning);
+
+    let snark_path = format!("data/test/{name}.snark");
+    let snark = gen_snark_shplonk(params, &pk, component_circuit, Some(snark_path));
+    Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
 }
 
 async fn generate_storage_snark(

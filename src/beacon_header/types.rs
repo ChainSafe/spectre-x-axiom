@@ -1,7 +1,18 @@
 use axiom_codec::types::native::HeaderSubquery;
-use axiom_eth::{utils::{build_utils::dummy::DummyFrom, component::{circuit::{CoreBuilderOutputParams, CoreBuilderParams}, types::{FixLenLogical, Flatten}}}, Field};
-use axiom_query::components::subqueries::{block_header::types::ComponentTypeHeaderSubquery, common::OutputSubqueryShard};
-use ethereum_consensus_types::{light_client::ExecutionPayloadHeader, presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES}};
+use axiom_eth::utils::{
+    build_utils::dummy::DummyFrom,
+    component::{
+        circuit::{CoreBuilderOutputParams, CoreBuilderParams},
+        types::{FixLenLogical, Flatten},
+    },
+};
+use axiom_query::components::subqueries::{
+    block_header::types::ComponentTypeHeaderSubquery, common::OutputSubqueryShard,
+};
+use ethereum_consensus_types::{
+    light_client::ExecutionPayloadHeader,
+    presets::minimal::{BYTES_PER_LOGS_BLOOM, MAX_EXTRA_DATA_BYTES},
+};
 use ethers_core::types::H256;
 use lightclient_circuits::witness::SyncStepArgs;
 use serde::{Deserialize, Serialize};
@@ -34,7 +45,6 @@ impl DummyFrom<CoreParamsBeaconSubquery> for CircuitInputBeaconShard {
     }
 }
 
-
 /// Specify the output format of BeaconSubquery component.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct CoreParamsBeaconSubquery {
@@ -53,7 +63,6 @@ pub struct LogicalPublicInstanceBeacon<T: Copy> {
     pub pub_inputs_commit: T,
     pub poseidon_commit: T,
 }
-
 
 impl<T: Copy> TryFrom<Vec<T>> for LogicalPublicInstanceBeacon<T> {
     type Error = anyhow::Error;
