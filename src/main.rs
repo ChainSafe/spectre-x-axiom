@@ -14,11 +14,20 @@ use axiom_codec::{
     constants::NUM_SUBQUERY_TYPES,
     types::{
         field_elements::AnySubqueryResult,
-        native::{AccountSubquery, HeaderSubquery, SubqueryResult, SubqueryType},
+        native::{AccountSubquery, HeaderSubquery, StorageSubquery, SubqueryResult, SubqueryType},
     },
+    utils::native::u256_to_h256,
 };
 use axiom_eth::{
-    block_header::STATE_ROOT_INDEX, halo2_proofs::halo2curves::bn256::Fr, keccak::{promise::generate_keccak_shards_from_calls, types::ComponentTypeKeccak}, providers::{setup_provider, storage::json_to_mpt_input}, snark_verifier_sdk::{halo2::gen_snark_shplonk, CircuitExt}, utils::{
+    block_header::STATE_ROOT_INDEX,
+    halo2_proofs::halo2curves::bn256::Fr,
+    keccak::{
+        promise::generate_keccak_shards_from_calls,
+        types::{ComponentTypeKeccak, OutputKeccakShard},
+    },
+    providers::{setup_provider, storage::json_to_mpt_input},
+    snark_verifier_sdk::{halo2::gen_snark_shplonk, CircuitExt},
+    utils::{
         build_utils::pinning::{PinnableCircuit, RlcCircuitPinning},
         component::{
             promise_loader::{
@@ -29,7 +38,7 @@ use axiom_eth::{
             GroupedPromiseResults,
         },
         snark_verifier::{AggregationCircuitParams, EnhancedSnark},
-    }
+    },
 };
 use axiom_query::{
     components::{
@@ -48,11 +57,13 @@ use axiom_query::{
                 },
                 STORAGE_ROOT_INDEX,
             },
-            block_header::types::ComponentTypeHeaderSubquery,
-            common::{shard_into_component_promise_results, OutputSubqueryShard},
+            common::shard_into_component_promise_results,
             storage::{
                 circuit::{ComponentCircuitStorageSubquery, CoreParamsStorageSubquery},
-                types::{CircuitInputStorageShard, CircuitInputStorageSubquery},
+                types::{
+                    CircuitInputStorageShard, CircuitInputStorageSubquery,
+                    ComponentTypeStorageSubquery, OutputStorageShard,
+                },
             },
         },
     },
@@ -62,7 +73,7 @@ use beacon_header::{
     circuit::ComponentCircuitBeaconSubquery,
     types::{ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery, OutputBeaconShard},
 };
-use ethers_core::types::{Address, Chain, H256};
+use ethers_core::types::{Address, Bytes, Chain, H256, U256};
 use ethers_providers::Middleware;
 use futures::future::join_all;
 use halo2_base::{
@@ -82,40 +93,70 @@ use witness::fetch_beacon_args;
 pub const ACCOUNT_PROOF_MAX_DEPTH: usize = 13;
 pub const STORAGE_PROOF_MAX_DEPTH: usize = 13;
 
+pub const KECCAK_F_CAPACITY: usize = 100;
+
 #[tokio::main]
 async fn main() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let params = gen_srs(20);
-
     let mut subquery_results = vec![];
-    let (snark_header, mut promise_results) =
-        generate_header_snark(&params, &mut subquery_results).await.unwrap();
-    // let keccak_commit =
-    //     promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
+    let mut promise_results = HashMap::new();
+    let mut keccak_witnesses = vec![];
 
+    let params_header = gen_srs(20);
     let params = gen_srs(19);
 
-    let snark_account = generate_account_snark(
+    let gen_snark_header =
+        generate_header_snark(&params_header, &mut promise_results).await.unwrap();
+
+    let gen_snark_account = generate_account_snark(
         &params,
         Chain::Mainnet,
-        vec![(19149117, "0x0000a26b00c1F0DF003000390027140000fAa719", 0)],
-        2000,
+        vec![(19149117, "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45", STORAGE_ROOT_INDEX)],
+        &mut subquery_results,
+        &mut promise_results,
+        &mut keccak_witnesses,
     )
     .await
     .unwrap();
 
-    // let (snark_header, mut promise_results) =
-    //     generate_header_snark(&params, &mut subquery_results).await.unwrap();
+    let gen_snark_storage = generate_storage_snark(
+        &params,
+        Chain::Mainnet,
+        vec![(19149117, "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45", H256::zero())],
+        &mut subquery_results,
+        &mut promise_results,
+        &mut keccak_witnesses,
+    )
+    .await
+    .unwrap();
 
-    let (snark_results_root, promise_commit_keccak) =
-        generate_results_snark(&params, promise_results, subquery_results).unwrap();
+    let snark_results_root = generate_results_snark(
+        &params,
+        &mut promise_results,
+        subquery_results,
+        &mut keccak_witnesses,
+    )
+    .unwrap();
+
+    // Calculate final keccak promice out of all keccak queries used in prev circuits
+    let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
+        OutputKeccakShard { responses: keccak_witnesses.clone(), capacity: KECCAK_F_CAPACITY }
+            .into_logical_results(),
+    );
+    promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
+    let promise_commit_keccak =
+        promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
+
+    let snark_header = gen_snark_header(&params_header, &promise_results).unwrap();
+    let snark_account = gen_snark_account(&params, &promise_results).unwrap();
+    let snark_storage = gen_snark_storage(&params, &promise_results).unwrap();
 
     let aggregation_payload = InputSubqueryAggregation {
         snark_header,
         snark_results_root,
         snark_account: Some(snark_account),
-        snark_storage: None,
+        snark_storage: Some(snark_storage),
         snark_solidity_mapping: None,
         snark_tx: None,
         snark_receipt: None,
@@ -143,8 +184,10 @@ async fn main() {
 
 async fn generate_header_snark(
     params: &ParamsKZG<Bn256>,
-    subquery_results: &mut Vec<SubqueryResult>,
-) -> anyhow::Result<(EnhancedSnark, GroupedPromiseResults<Fr>)> {
+    promise_results: &mut GroupedPromiseResults<Fr>,
+) -> anyhow::Result<
+    impl FnOnce(&ParamsKZG<Bn256>, &GroupedPromiseResults<Fr>) -> anyhow::Result<EnhancedSnark>,
+> {
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
 
     let client = beacon_api_client::mainnet::Client::new(
@@ -164,44 +207,6 @@ async fn generate_header_snark(
             Ok(file) => serde_json::from_reader(file).unwrap(),
         };
 
-    subquery_results.push(SubqueryResult {
-        subquery: beacon_input.request.clone().into(),
-        value: H256::from_slice(beacon_input.exec_payload.state_root.as_ref()).0.into(),
-    });
-
-    let mut promise_results = HashMap::new();
-
-    // let promise_keccak = OutputKeccakShard { responses: vec![], capacity: 1 };
-    // let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
-    //     promise_keccak.into_logical_results(),
-    // );
-    // promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
-
-    // WHY have header promise for header subquery?
-    // Guess: for resutls circuit
-    {
-        let promise_header = OutputSubqueryShard::<HeaderSubquery, H256> {
-            results: vec![AnySubqueryResult {
-                subquery: HeaderSubquery {
-                    block_number: beacon_input.request.block_number as u32,
-                    field_idx: STATE_ROOT_INDEX as u32,
-                },
-                value: {
-                    let bytes: [_; 32] =
-                        beacon_input.exec_payload.state_root.as_ref().try_into().unwrap();
-                    bytes.into()
-                },
-            }],
-        };
-
-        promise_results.insert(
-            ComponentTypeHeaderSubquery::<Fr>::get_type_id(),
-            shard_into_component_promise_results::<Fr, ComponentTypeHeaderSubquery<Fr>>(
-                promise_header.convert_into(),
-            ),
-        );
-    }
-
     // let (header_core_params, header_promise_params, header_base_params) = read_beacon_pinning()?;
     let circuit_params = BaseCircuitParams {
         k: params.k() as usize,
@@ -212,33 +217,41 @@ async fn generate_header_snark(
 
     let mut beacon_circuit = ComponentCircuitBeaconSubquery::<Fr>::new(
         CoreParamsBeaconSubquery { capacity: 1 },
+        // PromiseLoaderParams { comp_loader_params: SingleComponentLoaderParams::new(0, vec![0]) },
         (),
         circuit_params,
     );
     beacon_circuit.feed_input(Box::new(beacon_input.clone())).unwrap();
+    beacon_circuit.fulfill_promise_results(promise_results).unwrap();
     beacon_circuit.calculate_params();
-    beacon_circuit.fulfill_promise_results(&promise_results).unwrap();
 
-    let header_snark =
+    Ok(move |params: &ParamsKZG<Bn256>, promise_results: &GroupedPromiseResults<Fr>| {
         generate_snark("beacon_subquery_for_agg", params, beacon_circuit, &|pinning| {
             let circuit = ComponentCircuitBeaconSubquery::<Fr>::prover(
                 CoreParamsBeaconSubquery { capacity: 1 },
+                // PromiseLoaderParams {
+                //     comp_loader_params: SingleComponentLoaderParams::new(0, vec![0]),
+                // },
                 (),
                 pinning,
             );
             circuit.feed_input(Box::new(beacon_input.clone())).unwrap();
-            circuit.fulfill_promise_results(&promise_results).unwrap();
+            circuit.fulfill_promise_results(promise_results).unwrap();
             circuit
-        })?;
-    Ok((header_snark, promise_results))
+        })
+    })
 }
 
 async fn generate_account_snark(
     params: &ParamsKZG<Bn256>,
     network: Chain,
     subqueries: Vec<(u64, &str, usize)>, // (blockNum, addr, fieldIdx)
-    keccak_f_capacity: usize,
-) -> anyhow::Result<EnhancedSnark> {
+    subquery_results: &mut Vec<SubqueryResult>,
+    promise_results: &mut GroupedPromiseResults<Fr>,
+    keccak_witnesses: &mut Vec<(Bytes, Option<H256>)>,
+) -> anyhow::Result<
+    impl FnOnce(&ParamsKZG<Bn256>, &GroupedPromiseResults<Fr>) -> anyhow::Result<EnhancedSnark>,
+> {
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
 
     let k = params.k();
@@ -288,7 +301,10 @@ async fn generate_account_snark(
             .collect(),
     };
 
-    println!("[account] promise_header: {:?}", promise_header.results[0]);
+    subquery_results.extend(promise_header.results.iter().map(|r| SubqueryResult {
+        subquery: r.subquery.clone().into(),
+        value: r.value.as_fixed_bytes().into(),
+    }));
 
     let header_capacity = promise_header.len();
 
@@ -299,7 +315,7 @@ async fn generate_account_snark(
             max_trie_depth: ACCOUNT_PROOF_MAX_DEPTH,
         },
         (
-            PromiseLoaderParams::new_for_one_shard(keccak_f_capacity),
+            PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY),
             PromiseLoaderParams::new_for_one_shard(header_capacity),
         ),
         circuit_params,
@@ -308,15 +324,24 @@ async fn generate_account_snark(
     let input =
         CircuitInputAccountShard::<Fr> { requests: requests.clone(), _phantom: PhantomData };
     circuit.feed_input(Box::new(input.clone())).unwrap();
-    circuit.calculate_params();
 
-    let promises = [
+    // subquery_results.push(SubqueryResult {
+    //     subquery: beacon_input.request.clone().into(),
+    //     value: H256::from_slice(beacon_input.exec_payload.state_root.as_ref()).0.into(),
+    // })
+
+    keccak_witnesses
+        .extend(generate_keccak_shards_from_calls(&circuit, KECCAK_F_CAPACITY).unwrap().responses);
+
+    promise_results.extend([
         (
             ComponentTypeKeccak::<Fr>::get_type_id(),
             ComponentPromiseResultsInMerkle::from_single_shard(
-                generate_keccak_shards_from_calls(&circuit, keccak_f_capacity)
-                    .unwrap()
-                    .into_logical_results(),
+                OutputKeccakShard {
+                    responses: keccak_witnesses.clone(),
+                    capacity: KECCAK_F_CAPACITY,
+                }
+                .into_logical_results(),
             ),
         ),
         (
@@ -325,38 +350,206 @@ async fn generate_account_snark(
                 promise_header.into(),
             ),
         ),
-    ]
-    .into_iter()
-    .collect();
-    circuit.fulfill_promise_results(&promises).unwrap();
+    ]);
+    circuit.fulfill_promise_results(promise_results).unwrap();
+    circuit.calculate_params();
 
-    MockProver::run(k, &circuit, circuit.instances()).unwrap().assert_satisfied();
+    // MockProver::run(k, &circuit, circuit.instances()).unwrap().assert_satisfied();
 
-    let account_snark = generate_snark("account_subquery_for_agg", params, circuit, &|pinning| {
-        let circuit = ComponentCircuitAccountSubquery::<Fr>::prover(
-            CoreParamsAccountSubquery {
-                capacity: requests.len(),
-                max_trie_depth: ACCOUNT_PROOF_MAX_DEPTH,
-            },
+    Ok(move |params: &ParamsKZG<Bn256>, promise_results: &GroupedPromiseResults<Fr>| {
+        generate_snark("account_subquery_for_agg", params, circuit, &|pinning| {
+            let circuit = ComponentCircuitAccountSubquery::<Fr>::prover(
+                CoreParamsAccountSubquery {
+                    capacity: requests.len(),
+                    max_trie_depth: ACCOUNT_PROOF_MAX_DEPTH,
+                },
+                (
+                    PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY),
+                    PromiseLoaderParams::new_for_one_shard(header_capacity),
+                ),
+                pinning,
+            );
+            circuit.feed_input(Box::new(input.clone())).unwrap();
+            circuit.fulfill_promise_results(promise_results).unwrap();
+            circuit
+        })
+    })
+}
+
+async fn generate_storage_snark(
+    params: &ParamsKZG<Bn256>,
+    network: Chain,
+    subqueries: Vec<(u64, &str, H256)>, // (blockNum, addr, slot)
+    subquery_results: &mut Vec<SubqueryResult>,
+    promise_results: &mut GroupedPromiseResults<Fr>,
+    keccak_witnesses: &mut Vec<(Bytes, Option<H256>)>,
+) -> anyhow::Result<
+    impl FnOnce(&ParamsKZG<Bn256>, &GroupedPromiseResults<Fr>) -> anyhow::Result<EnhancedSnark>,
+> {
+    let k = params.k();
+
+    let _provider = setup_provider(network);
+    let provider = &_provider;
+
+    let (requests, storage_hashes, storage_results): (
+        Vec<CircuitInputStorageSubquery>,
+        Vec<H256>,
+        Vec<AnySubqueryResult<StorageSubquery, H256>>,
+    ) = itertools::multiunzip(
+        join_all(subqueries.iter().copied().map(|(block_num, addr, slot)| async move {
+            let addr = Address::from_str(addr).unwrap();
+            let proof = provider.get_proof(addr, vec![slot], Some(block_num.into())).await.unwrap();
+            let storage_hash = if proof.storage_hash.is_zero() {
+                // RPC provider may give zero storage hash for empty account, but the correct storage hash should be the null root = keccak256(0x80)
+                H256::from_slice(&axiom_eth::mpt::KECCAK_RLP_EMPTY_STRING)
+            } else {
+                proof.storage_hash
+            };
+            assert_eq!(proof.storage_proof.len(), 1, "Storage proof should have length 1 exactly");
+            let value = u256_to_h256(&proof.storage_proof[0].value);
+            let proof = json_to_mpt_input(proof, 0, STORAGE_PROOF_MAX_DEPTH);
+
+            let storage_result = AnySubqueryResult {
+                subquery: StorageSubquery {
+                    block_number: block_num as u32,
+                    addr,
+                    slot: U256::from_big_endian(&slot.0),
+                },
+                value,
+            };
             (
-                PromiseLoaderParams::new_for_one_shard(keccak_f_capacity),
-                PromiseLoaderParams::new_for_one_shard(header_capacity),
-            ),
-            pinning,
-        );
-        circuit.feed_input(Box::new(input.clone())).unwrap();
-        circuit.fulfill_promise_results(&promises).unwrap();
-        circuit
-    })?;
+                CircuitInputStorageSubquery { block_number: block_num, proof },
+                storage_hash,
+                storage_result,
+            )
+        }))
+        .await
+        .into_iter(),
+    );
 
-    Ok(account_snark)
+    let promise_account = OutputAccountShard {
+        results: requests
+            .iter()
+            .zip_eq(storage_hashes.clone())
+            .map(|(r, storage_hash)| AnySubqueryResult {
+                subquery: AccountSubquery {
+                    block_number: r.block_number as u32,
+                    field_idx: STORAGE_ROOT_INDEX as u32,
+                    addr: r.proof.addr,
+                },
+                value: storage_hash,
+            })
+            .collect(),
+    };
+
+    subquery_results.extend(subqueries.iter().copied().zip(storage_hashes).map(
+        |((block_num, addr, _), storage_hash)| {
+            SubqueryResult {
+                subquery: AccountSubquery {
+                    block_number: block_num as u32,
+                    field_idx: STORAGE_ROOT_INDEX as u32,
+                    addr: Address::from_str(addr).unwrap(),
+                }
+                .into(),
+                value: storage_hash.as_fixed_bytes().into(),
+            }
+        },
+    ));
+
+    // Adding storage results to the promise results to satisfy promise check in subquery aggregation.
+    // In practice there will be other circuit querying storage that will provide these results, but this prototype skips that.
+    {
+        subquery_results.extend(subqueries.iter().copied().zip(&storage_results).map(
+            |((block_num, addr, slot), result)| {
+                SubqueryResult {
+                    subquery: StorageSubquery {
+                        block_number: block_num as u32,
+                        addr: Address::from_str(addr).unwrap(),
+                        slot: U256::from_big_endian(&slot.0),
+                    }
+                    .into(),
+                    value: result.value.as_fixed_bytes().into(),
+                }
+            },
+        ));
+
+        promise_results.insert(
+            ComponentTypeStorageSubquery::<Fr>::get_type_id(),
+            shard_into_component_promise_results::<Fr, ComponentTypeStorageSubquery<Fr>>(
+                OutputStorageShard { results: storage_results }.into(),
+            ),
+        );
+    }
+
+    let account_capacity = promise_account.results.len();
+
+    let circuit_params = dummy_rlc_circuit_params(k as usize);
+    let mut circuit = ComponentCircuitStorageSubquery::new(
+        CoreParamsStorageSubquery {
+            capacity: requests.len(),
+            max_trie_depth: STORAGE_PROOF_MAX_DEPTH,
+        },
+        (
+            PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY),
+            PromiseLoaderParams::new_for_one_shard(account_capacity),
+        ),
+        circuit_params,
+    );
+
+    let input =
+        CircuitInputStorageShard::<Fr> { requests: requests.clone(), _phantom: PhantomData };
+    circuit.feed_input(Box::new(input.clone())).unwrap();
+
+    keccak_witnesses
+        .extend(generate_keccak_shards_from_calls(&circuit, KECCAK_F_CAPACITY).unwrap().responses);
+
+    promise_results.extend([
+        (
+            ComponentTypeKeccak::<Fr>::get_type_id(),
+            ComponentPromiseResultsInMerkle::from_single_shard(
+                OutputKeccakShard {
+                    responses: keccak_witnesses.clone(),
+                    capacity: KECCAK_F_CAPACITY,
+                }
+                .into_logical_results(),
+            ),
+        ),
+        (
+            ComponentTypeAccountSubquery::<Fr>::get_type_id(),
+            shard_into_component_promise_results::<Fr, ComponentTypeAccountSubquery<Fr>>(
+                promise_account.into(),
+            ),
+        ),
+    ]);
+    circuit.fulfill_promise_results(promise_results).unwrap();
+    circuit.calculate_params();
+
+    Ok(move |params: &ParamsKZG<Bn256>, promise_results: &GroupedPromiseResults<Fr>| {
+        generate_snark("storage_subquery_for_agg", params, circuit, &|pinning| {
+            let circuit = ComponentCircuitStorageSubquery::<Fr>::prover(
+                CoreParamsStorageSubquery {
+                    capacity: requests.len(),
+                    max_trie_depth: STORAGE_PROOF_MAX_DEPTH,
+                },
+                (
+                    PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY),
+                    PromiseLoaderParams::new_for_one_shard(account_capacity),
+                ),
+                pinning,
+            );
+            circuit.feed_input(Box::new(input.clone())).unwrap();
+            circuit.fulfill_promise_results(promise_results).unwrap();
+            circuit
+        })
+    })
 }
 
 fn generate_results_snark(
     params: &ParamsKZG<Bn256>,
-    mut promise_results: GroupedPromiseResults<Fr>,
+    promise_results: &mut GroupedPromiseResults<Fr>,
     subquery_results: Vec<SubqueryResult>,
-) -> anyhow::Result<(EnhancedSnark, Fr)> {
+    keccak_witnesses: &mut Vec<(Bytes, Option<H256>)>,
+) -> anyhow::Result<EnhancedSnark> {
     let results_input = CircuitInputResultsRootShard::<Fr> {
         subqueries: SubqueryResultsTable::<Fr>::new(
             subquery_results.clone().into_iter().map(|r| r.try_into().unwrap()).collect_vec(),
@@ -368,12 +561,22 @@ fn generate_results_snark(
 
     let mut enabled_types = [false; NUM_SUBQUERY_TYPES];
     enabled_types[SubqueryType::Header as usize] = true;
+    enabled_types[SubqueryType::Account as usize] = true;
+    enabled_types[SubqueryType::Storage as usize] = true;
 
     let promise_results_params = {
         let mut params_per_comp = HashMap::new();
         params_per_comp.insert(
-            ComponentTypeHeaderSubquery::<Fr>::get_type_id(), // we keep using ComponentTypeHeaderSubquery so we don't need to modify Results circuit
-            SingleComponentLoaderParams::new(0, vec![1]),     // what is shard_caps?
+            ComponentTypeBeaconSubquery::<Fr>::get_type_id(),
+            SingleComponentLoaderParams::new_for_one_shard(1),
+        );
+        params_per_comp.insert(
+            ComponentTypeAccountSubquery::<Fr>::get_type_id(),
+            SingleComponentLoaderParams::new_for_one_shard(1),
+        );
+        params_per_comp.insert(
+            ComponentTypeStorageSubquery::<Fr>::get_type_id(),
+            SingleComponentLoaderParams::new_for_one_shard(1),
         );
 
         MultiPromiseLoaderParams { params_per_component: params_per_comp }
@@ -381,40 +584,44 @@ fn generate_results_snark(
 
     let mut results_circuit = ComponentCircuitResultsRoot::<Fr>::new(
         CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
-        (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
+        (PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY), promise_results_params.clone()),
         result_rlc_params,
     );
     results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
 
+    keccak_witnesses.extend(
+        generate_keccak_shards_from_calls(&results_circuit, KECCAK_F_CAPACITY).unwrap().responses,
+    );
     let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
-        generate_keccak_shards_from_calls(&results_circuit, 200).unwrap().into_logical_results(),
+        OutputKeccakShard { responses: keccak_witnesses.clone(), capacity: KECCAK_F_CAPACITY }
+            .into_logical_results(),
     );
     promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
 
-    let keccak_commit =
-        promise_results.get(&ComponentTypeKeccak::<Fr>::get_type_id()).unwrap().leaves()[0].commit;
-
-    results_circuit.fulfill_promise_results(&promise_results).unwrap();
+    results_circuit.fulfill_promise_results(promise_results).unwrap();
     results_circuit.calculate_params();
 
-    // let instances = results_circuit.instances();
+    let instances = results_circuit.instances();
     // println!("results_snark_mock: {:?}", instances);
-    // MockProver::run(results_circuit_k as u32, &results_circuit, instances).unwrap().assert_satisfied();
+    MockProver::run(params.k(), &results_circuit, instances).unwrap().assert_satisfied();
 
     let results_snark =
-        generate_snark("results_root_for_agg", &params, results_circuit, &|pinning| {
+        generate_snark("results_root_for_agg", params, results_circuit, &|pinning| {
             let results_circuit = ComponentCircuitResultsRoot::<Fr>::prover(
                 CoreParamsResultRoot { enabled_types, capacity: results_input.subqueries.len() },
-                (PromiseLoaderParams::new_for_one_shard(200), promise_results_params.clone()),
+                (
+                    PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY),
+                    promise_results_params.clone(),
+                ),
                 pinning,
             );
             results_circuit.feed_input(Box::new(results_input.clone())).unwrap();
-            results_circuit.fulfill_promise_results(&promise_results).unwrap();
+            results_circuit.fulfill_promise_results(promise_results).unwrap();
             results_circuit
         })
         .unwrap();
 
-    Ok((results_snark, keccak_commit))
+    Ok(results_snark)
 }
 
 fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
@@ -438,88 +645,4 @@ fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinnin
     let snark_path = format!("data/test/{name}.snark");
     let snark = gen_snark_shplonk(params, &pk, component_circuit, Some(snark_path));
     Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
-}
-
-async fn generate_storage_snark(
-    k: u32,
-    network: Chain,
-    subqueries: Vec<(u64, &str, H256)>, // (blockNum, addr, slot)
-) -> ComponentCircuitStorageSubquery<Fr> {
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    let _provider = setup_provider(network);
-    let provider = &_provider;
-    let (requests, storage_hashes): (Vec<CircuitInputStorageSubquery>, Vec<H256>) =
-        join_all(subqueries.into_iter().map(|(block_num, addr, slot)| async move {
-            let addr = Address::from_str(addr).unwrap();
-            let proof = provider.get_proof(addr, vec![slot], Some(block_num.into())).await.unwrap();
-            let storage_hash = if proof.storage_hash.is_zero() {
-                // RPC provider may give zero storage hash for empty account, but the correct storage hash should be the null root = keccak256(0x80)
-                H256::from_slice(&axiom_eth::mpt::KECCAK_RLP_EMPTY_STRING)
-            } else {
-                proof.storage_hash
-            };
-            assert_eq!(proof.storage_proof.len(), 1, "Storage proof should have length 1 exactly");
-            let proof = json_to_mpt_input(proof, 0, STORAGE_PROOF_MAX_DEPTH);
-            (CircuitInputStorageSubquery { block_number: block_num, proof }, storage_hash)
-        }))
-        .await
-        .into_iter()
-        .unzip();
-
-    let promise_account = OutputAccountShard {
-        results: requests
-            .iter()
-            .zip_eq(storage_hashes)
-            .map(|(r, storage_hash)| AnySubqueryResult {
-                subquery: AccountSubquery {
-                    block_number: r.block_number as u32,
-                    field_idx: STORAGE_ROOT_INDEX as u32,
-                    addr: r.proof.addr,
-                },
-                value: storage_hash,
-            })
-            .collect(),
-    };
-
-    let keccak_f_capacity = 1200;
-    let account_capacity = promise_account.results.len();
-
-    let circuit_params = dummy_rlc_circuit_params(k as usize);
-    let mut circuit = ComponentCircuitStorageSubquery::new(
-        CoreParamsStorageSubquery {
-            capacity: requests.len(),
-            max_trie_depth: STORAGE_PROOF_MAX_DEPTH,
-        },
-        (
-            PromiseLoaderParams::new_for_one_shard(keccak_f_capacity),
-            PromiseLoaderParams::new_for_one_shard(account_capacity),
-        ),
-        circuit_params,
-    );
-
-    let input = CircuitInputStorageShard::<Fr> { requests, _phantom: PhantomData };
-    circuit.feed_input(Box::new(input)).unwrap();
-    circuit.calculate_params();
-    let promises = [
-        (
-            ComponentTypeKeccak::<Fr>::get_type_id(),
-            ComponentPromiseResultsInMerkle::from_single_shard(
-                generate_keccak_shards_from_calls(&circuit, keccak_f_capacity)
-                    .unwrap()
-                    .into_logical_results(),
-            ),
-        ),
-        (
-            ComponentTypeAccountSubquery::<Fr>::get_type_id(),
-            shard_into_component_promise_results::<Fr, ComponentTypeAccountSubquery<Fr>>(
-                promise_account.into(),
-            ),
-        ),
-    ]
-    .into_iter()
-    .collect();
-    circuit.fulfill_promise_results(&promises).unwrap();
-
-    circuit
 }

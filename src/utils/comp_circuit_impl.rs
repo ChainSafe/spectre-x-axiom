@@ -8,10 +8,9 @@ use std::{
 
 use anyhow::anyhow;
 use axiom_eth::{
-    rlc::{
-        circuit::RlcCircuitParams,
-        virtual_region::RlcThreadBreakPoints,
-    }, snark_verifier_sdk, utils::{
+    rlc::{circuit::RlcCircuitParams, virtual_region::RlcThreadBreakPoints},
+    snark_verifier_sdk,
+    utils::{
         build_utils::{
             aggregation::CircuitMetadata,
             pinning::{CircuitPinningInstructions, Halo2CircuitPinning, RlcCircuitPinning},
@@ -27,7 +26,7 @@ use axiom_eth::{
             ComponentCircuit, ComponentPromiseResultsInMerkle, ComponentType, ComponentTypeId,
             GroupedPromiseCalls, GroupedPromiseResults, LogicalInputValue, PromiseShardMetadata,
         },
-    }
+    },
 };
 use halo2_base::{
     gates::{
@@ -125,8 +124,13 @@ where
         promise_builder_params: P::Params,
         prompt_rlc_pinning: RlcCircuitPinning,
     ) -> Self {
-        Self::new_impl(true, core_builder_params, promise_builder_params, prompt_rlc_pinning.params.base)
-            .use_break_points(prompt_rlc_pinning.break_points.base)
+        Self::new_impl(
+            true,
+            core_builder_params,
+            promise_builder_params,
+            prompt_rlc_pinning.params.base,
+        )
+        .use_break_points(prompt_rlc_pinning.break_points.base)
     }
 
     /// Calculate params. This should be called only after all promise results are fulfilled.
