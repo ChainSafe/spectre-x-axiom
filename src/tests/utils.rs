@@ -3,23 +3,18 @@ use axiom_codec::types::native::{AxiomV2ComputeQuery, AxiomV2ComputeSnark};
 use axiom_codec::utils::native::decode_hilo_to_h256;
 use axiom_codec::HiLo;
 use axiom_eth::halo2_proofs::halo2curves::bn256::Fr;
-use axiom_eth::keccak::promise::generate_keccak_shards_from_calls;
-use axiom_eth::keccak::types::ComponentTypeKeccak;
 use axiom_eth::rlc::circuit::RlcCircuitParams;
 use axiom_eth::snark_verifier::pcs::kzg::KzgDecidingKey;
 use axiom_eth::snark_verifier_sdk::halo2::{gen_snark_shplonk, read_snark};
 use axiom_eth::snark_verifier_sdk::{gen_pk, CircuitExt, Snark};
-use axiom_eth::utils::build_utils::pinning::{PinnableCircuit, RlcCircuitPinning};
-use axiom_eth::utils::component::promise_loader::single::PromiseLoaderParams;
-use axiom_eth::utils::component::ComponentCircuit;
-use axiom_eth::utils::component::{ComponentPromiseResultsInMerkle, ComponentType};
+use axiom_eth::utils::build_utils::pinning::PinnableCircuit;
 use axiom_eth::utils::snark_verifier::EnhancedSnark;
-use axiom_query::components::dummy_rlc_circuit_params;
 use axiom_query::components::results::types::{CircuitOutputResultsRoot, LogicOutputResultsRoot};
-use axiom_query::verify_compute::circuit::ComponentCircuitVerifyCompute;
 use axiom_query::verify_compute::types::{CircuitInputVerifyCompute, CoreParamsVerifyCompute};
 use axiom_query::verify_compute::utils::{
-    dummy_compute_circuit, get_metadata_from_protocol, get_onchain_vk_from_vk, reconstruct_snark_from_compute_query, write_onchain_vkey, UserCircuitParams, DEFAULT_CLIENT_METADATA, DEFAULT_USER_PARAMS
+    dummy_compute_circuit, get_metadata_from_protocol, get_onchain_vk_from_vk,
+    reconstruct_snark_from_compute_query, write_onchain_vkey, UserCircuitParams,
+    DEFAULT_CLIENT_METADATA, DEFAULT_USER_PARAMS,
 };
 use ethers_core::types::Bytes;
 use halo2_base::gates::circuit::builder::BaseCircuitBuilder;
@@ -29,7 +24,6 @@ use halo2_base::halo2_proofs::poly::kzg::commitment::ParamsKZG;
 use halo2curves::bn256::Bn256;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -159,7 +153,6 @@ pub fn reconstruct_verify_compute_circuit(
         ),
     ))
 }
-
 
 /// Create a dummy snark that **will verify** successfully.
 pub fn dummy_compute_snark(

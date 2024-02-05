@@ -8,7 +8,8 @@ use std::{collections::HashMap, marker::PhantomData};
 
 use axiom_codec::{types::field_elements::FieldHeaderSubquery, HiLo};
 use axiom_eth::{
-    block_header::{RECEIPT_ROOT_INDEX, STATE_ROOT_INDEX, TX_ROOT_INDEX}, utils::{
+    block_header::{RECEIPT_ROOT_INDEX, STATE_ROOT_INDEX, TX_ROOT_INDEX},
+    utils::{
         build_utils::aggregation::CircuitMetadata,
         bytes_be_to_u128,
         component::{
@@ -18,7 +19,8 @@ use axiom_eth::{
             utils::get_logical_value,
             LogicalResult,
         },
-    }, Field
+    },
+    Field,
 };
 use halo2_base::{
     gates::flex_gate::threads::CommonCircuitBuilder, halo2_proofs::plonk::ConstraintSystem,

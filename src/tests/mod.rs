@@ -4,7 +4,6 @@ use std::{
     fs::{self, File},
     marker::PhantomData,
     path::Path,
-    result,
     str::FromStr,
 };
 
@@ -21,10 +20,7 @@ use axiom_codec::{
     },
     utils::native::u256_to_h256,
 };
-use axiom_eth::utils::{
-    build_utils::pinning::{PinnableCircuit, RlcCircuitPinning},
-    snark_verifier,
-};
+use axiom_eth::utils::build_utils::pinning::PinnableCircuit;
 use axiom_eth::{
     block_header::STATE_ROOT_INDEX,
     halo2_proofs::halo2curves::bn256::Fr,
@@ -75,11 +71,12 @@ use axiom_query::{
             },
         },
     },
-    subquery_aggregation::types::{InputSubqueryAggregation, SUBQUERY_AGGREGATION_AGG_VKEY_HASH_IDX},
+    subquery_aggregation::types::{
+        InputSubqueryAggregation, SUBQUERY_AGGREGATION_AGG_VKEY_HASH_IDX,
+    },
     verify_compute::{
         circuit::ComponentCircuitVerifyCompute,
-        types::CircuitInputVerifyCompute,
-        utils::{default_compute_circuit, UserCircuitParams, DEFAULT_USER_PARAMS},
+        utils::{UserCircuitParams, DEFAULT_USER_PARAMS},
     },
 };
 use ethers_core::types::{Address, Bytes, Chain, H256, U256};
@@ -95,12 +92,10 @@ use halo2_base::{
 };
 use halo2curves::{bn256::Bn256, ff::Field};
 use itertools::Itertools;
-use std::io::Write;
 use url::Url;
 use utils::generate_snark;
-use zkevm_hashes::keccak::component::{
-    circuit::shard::{KeccakComponentShardCircuit, KeccakComponentShardCircuitParams},
-    output,
+use zkevm_hashes::keccak::component::circuit::shard::{
+    KeccakComponentShardCircuit, KeccakComponentShardCircuitParams,
 };
 
 use self::utils::reconstruct_verify_compute_circuit;
