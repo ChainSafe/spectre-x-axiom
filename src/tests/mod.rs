@@ -1,22 +1,29 @@
-#![feature(trait_alias)]
-#![feature(associated_type_defaults)]
-#![feature(associated_type_bounds)]
-#![feature(generic_const_exprs)]
-#![allow(incomplete_features)]
-
-mod beacon_header;
 mod utils;
-mod witness;
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    marker::PhantomData,
+    path::Path,
+    result,
+    str::FromStr,
+};
 
-use std::{collections::HashMap, fs::File, marker::PhantomData, str::FromStr};
-
+use crate::beacon_header::{
+    circuit::ComponentCircuitBeaconSubquery,
+    types::{ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery, OutputBeaconShard},
+};
+use crate::utils::witness::fetch_beacon_args;
 use axiom_codec::{
-    constants::NUM_SUBQUERY_TYPES,
+    constants::{NUM_SUBQUERY_TYPES, USER_MAX_OUTPUTS},
     types::{
-        field_elements::AnySubqueryResult,
+        field_elements::{AnySubqueryResult, FieldSubqueryResult, SUBQUERY_KEY_LEN},
         native::{AccountSubquery, HeaderSubquery, StorageSubquery, SubqueryResult, SubqueryType},
     },
     utils::native::u256_to_h256,
+};
+use axiom_eth::utils::{
+    build_utils::pinning::{PinnableCircuit, RlcCircuitPinning},
+    snark_verifier,
 };
 use axiom_eth::{
     block_header::STATE_ROOT_INDEX,
@@ -26,9 +33,8 @@ use axiom_eth::{
         types::{ComponentTypeKeccak, OutputKeccakShard},
     },
     providers::{setup_provider, storage::json_to_mpt_input},
-    snark_verifier_sdk::{halo2::gen_snark_shplonk, CircuitExt},
+    snark_verifier_sdk::{gen_pk, halo2::gen_snark_shplonk, CircuitExt},
     utils::{
-        build_utils::pinning::{PinnableCircuit, RlcCircuitPinning},
         component::{
             promise_loader::{
                 comp_loader::SingleComponentLoaderParams, multi::MultiPromiseLoaderParams,
@@ -37,16 +43,18 @@ use axiom_eth::{
             ComponentCircuit, ComponentPromiseResultsInMerkle, ComponentType,
             GroupedPromiseResults,
         },
+        merkle_aggregation::InputMerkleAggregation,
         snark_verifier::{AggregationCircuitParams, EnhancedSnark},
     },
 };
 use axiom_query::{
+    axiom_aggregation1::types::InputAxiomAggregation1,
     components::{
         dummy_rlc_circuit_params,
         results::{
             circuit::{ComponentCircuitResultsRoot, CoreParamsResultRoot},
             table::SubqueryResultsTable,
-            types::CircuitInputResultsRootShard,
+            types::{CircuitInputResultsRootShard, LogicOutputResultsRoot},
         },
         subqueries::{
             account::{
@@ -67,37 +75,47 @@ use axiom_query::{
             },
         },
     },
-    subquery_aggregation::types::InputSubqueryAggregation,
-};
-use beacon_header::{
-    circuit::ComponentCircuitBeaconSubquery,
-    types::{ComponentTypeBeaconSubquery, CoreParamsBeaconSubquery, OutputBeaconShard},
+    subquery_aggregation::types::{InputSubqueryAggregation, SUBQUERY_AGGREGATION_AGG_VKEY_HASH_IDX},
+    verify_compute::{
+        circuit::ComponentCircuitVerifyCompute,
+        types::CircuitInputVerifyCompute,
+        utils::{default_compute_circuit, UserCircuitParams, DEFAULT_USER_PARAMS},
+    },
 };
 use ethers_core::types::{Address, Bytes, Chain, H256, U256};
 use ethers_providers::Middleware;
 use futures::future::join_all;
 use halo2_base::{
-    gates::circuit::{BaseCircuitParams, CircuitBuilderStage},
+    gates::circuit::{builder::BaseCircuitBuilder, BaseCircuitParams, CircuitBuilderStage},
     halo2_proofs::{
         dev::MockProver,
         poly::{commitment::Params, kzg::commitment::ParamsKZG},
     },
     utils::fs::gen_srs,
 };
-use halo2curves::bn256::Bn256;
+use halo2curves::{bn256::Bn256, ff::Field};
 use itertools::Itertools;
 use std::io::Write;
 use url::Url;
-use witness::fetch_beacon_args;
+use utils::generate_snark;
+use zkevm_hashes::keccak::component::{
+    circuit::shard::{KeccakComponentShardCircuit, KeccakComponentShardCircuitParams},
+    output,
+};
+
+use self::utils::reconstruct_verify_compute_circuit;
 
 pub const ACCOUNT_PROOF_MAX_DEPTH: usize = 13;
 pub const STORAGE_PROOF_MAX_DEPTH: usize = 13;
 
 pub const KECCAK_F_CAPACITY: usize = 100;
 
-#[tokio::main]
-async fn main() {
+#[tokio::test]
+async fn test_beacon_query_e2e() {
     let _ = env_logger::builder().is_test(true).try_init();
+    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
+    fs::create_dir_all(format!("{cargo_manifest_dir}/configs/test")).unwrap();
+    fs::create_dir_all(format!("{cargo_manifest_dir}/data/test")).unwrap();
 
     let mut subquery_results = vec![];
     let mut promise_results = HashMap::new();
@@ -131,6 +149,18 @@ async fn main() {
     .await
     .unwrap();
 
+    let compute_params = gen_srs(14);
+
+    let gen_snark_verify_compute = generate_verify_compute(
+        "compute_for_agg",
+        &compute_params,
+        &params,
+        subquery_results.clone(),
+        &mut keccak_witnesses,
+        Chain::Mainnet.into(),
+    )
+    .unwrap();
+
     let snark_results_root = generate_results_snark(
         &params,
         &mut promise_results,
@@ -140,9 +170,10 @@ async fn main() {
     .unwrap();
 
     // Calculate final keccak promice out of all keccak queries used in prev circuits
+    let keccak_shard =
+        OutputKeccakShard { responses: keccak_witnesses.clone(), capacity: KECCAK_F_CAPACITY };
     let keccak_merkle = ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
-        OutputKeccakShard { responses: keccak_witnesses.clone(), capacity: KECCAK_F_CAPACITY }
-            .into_logical_results(),
+        keccak_shard.clone().into_logical_results(),
     );
     promise_results.insert(ComponentTypeKeccak::<Fr>::get_type_id(), keccak_merkle);
     let promise_commit_keccak =
@@ -151,6 +182,7 @@ async fn main() {
     let snark_header = gen_snark_header(&params_header, &promise_results).unwrap();
     let snark_account = gen_snark_account(&params, &promise_results).unwrap();
     let snark_storage = gen_snark_storage(&params, &promise_results).unwrap();
+    let snark_verify_compute = gen_snark_verify_compute(&params, &promise_results).unwrap();
 
     let aggregation_payload = InputSubqueryAggregation {
         snark_header,
@@ -163,23 +195,55 @@ async fn main() {
         promise_commit_keccak,
     };
 
-    let mut agg_circuit = aggregation_payload
+    let agg_params = params_header;
+
+    let mut keygen_circuit = aggregation_payload
+        .clone()
         .build(
-            CircuitBuilderStage::Mock,
+            CircuitBuilderStage::Keygen,
             AggregationCircuitParams {
                 degree: params.k(),
-                num_advice: 0,
-                num_lookup_advice: 0,
-                num_fixed: 0,
-                lookup_bits: 8,
+                lookup_bits: (params.k() as usize) - 1,
+                ..Default::default()
             },
-            //rlc_circuit_params.base.try_into().unwrap(),
             &params,
         )
         .unwrap();
-    agg_circuit.calculate_params(Some(9));
-    let instances = agg_circuit.instances();
-    MockProver::run(params.k(), &agg_circuit, instances).unwrap().assert_satisfied();
+    keygen_circuit.calculate_params(Some(20));
+
+    let mut snark_subquery_agg =
+        generate_snark("subquery_aggregation_for_agg", &agg_params, keygen_circuit, &|pinning| {
+            aggregation_payload.clone().prover_circuit(pinning, &params).unwrap()
+        })
+        .unwrap();
+    snark_subquery_agg.agg_vk_hash_idx = Some(SUBQUERY_AGGREGATION_AGG_VKEY_HASH_IDX);
+
+    let snark_keccak_agg = gen_keccak_snark(&params, &agg_params, keccak_shard).unwrap();
+
+    let agg1_input =
+        InputAxiomAggregation1 { snark_verify_compute, snark_subquery_agg, snark_keccak_agg };
+    let agg1_params = agg_params; //gen_srs(22);
+    let mut keygen_circuit = agg1_input
+        .clone()
+        .build(
+            CircuitBuilderStage::Mock,
+            AggregationCircuitParams {
+                degree: agg1_params.k(),
+                lookup_bits: (agg1_params.k() as usize) - 1,
+                ..Default::default()
+            },
+            &agg1_params,
+        )
+        .unwrap();
+    keygen_circuit.calculate_params(Some(20));
+
+    MockProver::run(agg1_params.k(), &keygen_circuit, keygen_circuit.instances())
+        .unwrap()
+        .assert_satisfied();
+
+    // let _ = generate_snark("axiom_aggregation1", &agg1_params, keygen_circuit, &|pinning| {
+    //     agg1_input.clone().prover_circuit(pinning, &agg1_params).unwrap()
+    // }).unwrap();
 }
 
 async fn generate_header_snark(
@@ -624,25 +688,191 @@ fn generate_results_snark(
     Ok(results_snark)
 }
 
-fn generate_snark<C: CircuitExt<Fr> + PinnableCircuit<Pinning = RlcCircuitPinning>>(
-    name: &'static str,
-    params: &ParamsKZG<Bn256>,
-    keygen_circuit: C,
-    load_prover_circuit: &impl Fn(RlcCircuitPinning) -> C,
+fn gen_keccak_snark(
+    keccak_params: &ParamsKZG<Bn256>,
+    merkle_agg_params: &ParamsKZG<Bn256>,
+    keccak_shard: OutputKeccakShard,
 ) -> anyhow::Result<EnhancedSnark> {
     let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let pinning_path = format!("{cargo_manifest_dir}/configs/test/{name}.json");
-    let pk_path = format!("{cargo_manifest_dir}/data/test/{name}.pk");
-    let (pk, pinning) = keygen_circuit.create_pk(params, pk_path, pinning_path)?;
-    let vk = pk.get_vk();
-    let mut vk_file = File::create(format!("data/test/{name}.vk"))?;
-    vk.write(&mut vk_file, axiom_eth::halo2_proofs::SerdeFormat::RawBytes)?;
-    let mut vk_file = File::create(format!("data/test/{name}.vk.txt"))?;
-    write!(vk_file, "{:?}", vk.pinned())?;
+    let k = keccak_params.k();
+    let mut _keccak_params =
+        KeccakComponentShardCircuitParams::new(k as usize, 109, keccak_shard.capacity, false);
+    _keccak_params.base_circuit_params =
+        KeccakComponentShardCircuit::<Fr>::calculate_base_circuit_params(&_keccak_params);
 
-    let component_circuit = load_prover_circuit(pinning);
+    let keygen_circuit =
+        KeccakComponentShardCircuit::<Fr>::new(vec![], _keccak_params.clone(), false);
 
-    let snark_path = format!("data/test/{name}.snark");
-    let snark = gen_snark_shplonk(params, &pk, component_circuit, Some(snark_path));
-    Ok(EnhancedSnark { inner: snark, agg_vk_hash_idx: None })
+    let snark = {
+        if let Ok(file) =
+            File::open(format!("{cargo_manifest_dir}/configs/test/keccak_shard_for_agg.json"))
+        {
+            let break_points = serde_json::from_reader(file)?;
+            keygen_circuit.set_base_circuit_break_points(break_points);
+        }
+        let pk = gen_pk(
+            keccak_params,
+            &keygen_circuit,
+            Some(Path::new(&format!("{cargo_manifest_dir}/data/test/keccak_shard_for_agg.pk"))),
+        );
+        let break_points = keygen_circuit.base_circuit_break_points();
+        let file =
+            File::create(format!("{cargo_manifest_dir}/configs/test/keccak_shard_for_agg.json"))?;
+        serde_json::to_writer(file, &break_points)?;
+        let inputs = keccak_shard.responses.iter().map(|(k, _)| k.to_vec()).collect_vec();
+
+        let prover_circuit = KeccakComponentShardCircuit::<Fr>::new(inputs, _keccak_params, true);
+        prover_circuit.set_base_circuit_break_points(break_points);
+        let snark_path = format!("{cargo_manifest_dir}/data/test/keccak_shard_for_agg.snark");
+        gen_snark_shplonk(keccak_params, &pk, prover_circuit, Some(snark_path))
+    };
+
+    let k = merkle_agg_params.k();
+    let agg_input = InputMerkleAggregation::new([EnhancedSnark::new(snark, None)]);
+
+    let circuit_params =
+        AggregationCircuitParams { degree: k, lookup_bits: k as usize - 1, ..Default::default() };
+    let mut keygen_circuit =
+        agg_input.clone().build(CircuitBuilderStage::Keygen, circuit_params, merkle_agg_params)?;
+    keygen_circuit.calculate_params(Some(20));
+
+    generate_snark("keccak_for_agg", merkle_agg_params, keygen_circuit, &|pinning| {
+        agg_input.clone().prover_circuit(pinning, merkle_agg_params).unwrap()
+    })
+}
+
+pub fn test_compute_circuit(
+    k: u32,
+    user_params: UserCircuitParams,
+    subquery_results: LogicOutputResultsRoot,
+    result_len: usize,
+) -> BaseCircuitBuilder<Fr> {
+    let circuit_params = user_params.base_circuit_params(k as usize);
+    let mut builder = BaseCircuitBuilder::new(false).use_params(circuit_params);
+    // let range = builder.range_chip();
+
+    let ctx = builder.main(0);
+
+    let mut compute_results = vec![];
+    let mut data_instances = vec![];
+    for result in subquery_results.results.into_iter().take(subquery_results.num_subqueries) {
+        let result = FieldSubqueryResult::<Fr>::try_from(result).unwrap();
+        let data_instance = ctx.assign_witnesses(result.to_fixed_array());
+        compute_results.extend(data_instance[SUBQUERY_KEY_LEN..][..2].to_vec());
+        data_instances.extend(data_instance);
+    }
+    assert!(compute_results.len() >= 2 * result_len);
+    compute_results.truncate(2 * result_len);
+    compute_results.resize_with(2 * USER_MAX_OUTPUTS, || ctx.load_witness(Fr::ZERO));
+
+    let mut assigned_instance = compute_results;
+    assigned_instance.extend(data_instances);
+    assigned_instance
+        .resize_with(DEFAULT_USER_PARAMS.num_instances(), || ctx.load_witness(Fr::ZERO));
+    builder.assigned_instances[0] = assigned_instance;
+
+    builder
+}
+
+fn generate_verify_compute(
+    compute_name: &str,
+    compute_params: &ParamsKZG<Bn256>,
+    verify_params: &ParamsKZG<Bn256>,
+    subquery_results: Vec<SubqueryResult>,
+    keccak_witnesses: &mut Vec<(Bytes, Option<H256>)>,
+    source_chain_id: u64,
+) -> anyhow::Result<
+    impl FnOnce(&ParamsKZG<Bn256>, &GroupedPromiseResults<Fr>) -> anyhow::Result<EnhancedSnark>,
+> {
+    let subquery_results = LogicOutputResultsRoot {
+        subquery_hashes: subquery_results.iter().map(|r| r.subquery.keccak()).collect_vec(),
+        num_subqueries: subquery_results.len(),
+        results: subquery_results,
+    };
+    let result_len = subquery_results.num_subqueries;
+    let max_num_subqueries = subquery_results.results.len();
+    let app_k = compute_params.k();
+    let mut logic_input = utils::get_base_input(
+        compute_name,
+        compute_params,
+        USER_MAX_OUTPUTS,
+        test_compute_circuit(app_k, DEFAULT_USER_PARAMS, subquery_results.clone(), result_len),
+        subquery_results,
+        source_chain_id,
+        result_len,
+    )?;
+
+    // let default_input = utils::get_base_input(
+    //     compute_name,
+    //     compute_params,
+    //     USER_MAX_OUTPUTS,
+    //     default_compute_circuit(app_k),
+    //     LogicOutputResultsRoot {
+    //         results: vec![Default::default(); max_num_subqueries],
+    //         subquery_hashes: vec![Default::default(); max_num_subqueries],
+    //         num_subqueries: 0,
+    //     },
+    //     0,
+    //     0,
+    // )?;
+    let (core_params, default_compute_circuit) =
+        reconstruct_verify_compute_circuit(logic_input.clone(), compute_params)?;
+
+    let circuit_k = verify_params.k();
+
+    let cargo_manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let pinning_path = format!("{cargo_manifest_dir}/configs/test/verify_{compute_name}.json");
+    let pk_path = format!("{cargo_manifest_dir}/data/test/verify_{compute_name}.pk");
+
+    let circuit = {
+        let k = circuit_k as usize;
+        let mut rlc_params = dummy_rlc_circuit_params(k);
+        rlc_params.base.lookup_bits = Some(k - 1);
+        let loader_params = PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY);
+        let mut circuit =
+            ComponentCircuitVerifyCompute::new(core_params, loader_params, rlc_params);
+        circuit.feed_input(Box::new(default_compute_circuit)).unwrap();
+        circuit.calculate_params();
+        let promise_results = HashMap::from_iter([(
+            ComponentTypeKeccak::<Fr>::get_type_id(),
+            ComponentPromiseResultsInMerkle::from_single_shard(
+                generate_keccak_shards_from_calls(&circuit, KECCAK_F_CAPACITY)
+                    .unwrap()
+                    .into_logical_results(),
+            ),
+        )]);
+        circuit.fulfill_promise_results(&promise_results).unwrap();
+        circuit
+    };
+    let (pk, pinning) = circuit.create_pk(verify_params, pk_path, pinning_path)?;
+
+    let loader_params = PromiseLoaderParams::new_for_one_shard(KECCAK_F_CAPACITY);
+
+    let first = logic_input.subquery_results.results[0].clone();
+    logic_input.subquery_results.results.resize(max_num_subqueries, first);
+    let first = logic_input.subquery_results.subquery_hashes[0];
+    logic_input.subquery_results.subquery_hashes.resize(max_num_subqueries, first);
+    let (core_params, input) = reconstruct_verify_compute_circuit(logic_input, compute_params)?;
+    let circuit =
+        ComponentCircuitVerifyCompute::prover(core_params, loader_params, pinning.clone());
+    circuit.feed_input(Box::new(input)).unwrap();
+
+    keccak_witnesses
+        .extend(generate_keccak_shards_from_calls(&circuit, KECCAK_F_CAPACITY).unwrap().responses);
+
+    // let promise_results = HashMap::from_iter([(
+    //     ComponentTypeKeccak::<Fr>::get_type_id(),
+    //     ComponentPromiseResultsInMerkle::<Fr>::from_single_shard(
+    //         OutputKeccakShard { responses: keccak_witnesses.clone(), capacity: KECCAK_F_CAPACITY }
+    //             .into_logical_results(),
+    //     )
+    // )]);
+    let snark_path = format!("{cargo_manifest_dir}/data/test/verify_{compute_name}.snark");
+
+    Ok(move |params: &ParamsKZG<Bn256>, promise_results: &GroupedPromiseResults<Fr>| {
+        circuit.fulfill_promise_results(promise_results).unwrap();
+        let snark = gen_snark_shplonk(params, &pk, circuit, Some(snark_path));
+
+        Ok(EnhancedSnark::new(snark, None))
+    })
 }
