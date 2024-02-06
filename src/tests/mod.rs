@@ -232,13 +232,9 @@ async fn test_beacon_query_e2e() {
         .unwrap();
     keygen_circuit.calculate_params(Some(20));
 
-    MockProver::run(agg1_params.k(), &keygen_circuit, keygen_circuit.instances())
-        .unwrap()
-        .assert_satisfied();
-
-    // let _ = generate_snark("axiom_aggregation1", &agg1_params, keygen_circuit, &|pinning| {
-    //     agg1_input.clone().prover_circuit(pinning, &agg1_params).unwrap()
-    // }).unwrap();
+    let _ = generate_snark("axiom_aggregation1", &agg1_params, keygen_circuit, &|pinning| {
+        agg1_input.clone().prover_circuit(pinning, &agg1_params).unwrap()
+    }).unwrap();
 }
 
 async fn generate_header_snark(

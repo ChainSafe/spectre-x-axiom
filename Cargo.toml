@@ -30,14 +30,14 @@ rand_core = { version = "0.6", default-features = false, features = [
 tokio = { version = "1.33", features = ["macros"] }
 
 # halo2
-halo2-base = { git = "https://github.com/axiom-crypto/halo2-lib", branch = "community-edition", default-features = false, features = [
+halo2-base = { git = "https://github.com/axiom-crypto/halo2-lib", tag = "v0.4.1", default-features = false, features = [
     "halo2-axiom",
     "display",
     "jemallocator",
 ] }
-halo2-ecc = { git = "https://github.com/axiom-crypto/halo2-lib", branch = "community-edition", default-features = false }
-zkevm-hashes = { git = "https://github.com/axiom-crypto/halo2-lib", branch = "community-edition", default-features = false }
-halo2curves = { package = "halo2curves-axiom", version = "0.5" }
+halo2-ecc = { git = "https://github.com/axiom-crypto/halo2-lib", tag = "v0.4.1", default-features = false }
+zkevm-hashes = { git = "https://github.com/axiom-crypto/halo2-lib", tag = "v0.4.1", default-features = false }
+halo2curves = { package = "halo2curves-axiom", version = "=0.5.2" }
 
 # axiom
 axiom-eth = { version = "=0.4.0", git = "https://github.com/axiom-crypto/axiom-eth", default-features = false, features = [
@@ -48,12 +48,12 @@ axiom-eth = { version = "=0.4.0", git = "https://github.com/axiom-crypto/axiom-e
     "display",
 ] }
 axiom-query = { version = "=2.0.14", git = "https://github.com/axiom-crypto/axiom-eth", default-features = false }
-axiom-codec = { version = "0.2.0", git = "https://github.com/axiom-crypto/axiom-eth", default-features = false }
+axiom-codec = { version = "=0.2.0", git = "https://github.com/axiom-crypto/axiom-eth", default-features = false }
 
 # spectre
-lightclient-circuits = { version = "=0.1.0", path = "../Spectre/lightclient-circuits" }
-spectre-eth-types = { version = "=0.1.0", path = "../Spectre/eth-types", package = "eth-types" }
-spectre-preprocessor = { version = "=0.1.0", path = "../Spectre/preprocessor", package = "preprocessor" }
+lightclient-circuits = { version = "=0.1.0", git = "https://github.com/ChainSafe/Spectre", rev = "83b0bc1b4102657f9b295e2816d494d541cbd004" }
+spectre-eth-types = { version = "=0.1.0", package = "eth-types", git = "https://github.com/ChainSafe/Spectre", rev = "83b0bc1b4102657f9b295e2816d494d541cbd004" }
+spectre-preprocessor = { version = "=0.1.0", package = "preprocessor", git = "https://github.com/ChainSafe/Spectre", rev = "83b0bc1b4102657f9b295e2816d494d541cbd004" }
 
 # ethereum
 ssz_rs = { git = "https://github.com/ralexstokes/ssz-rs", rev = "5f1ec833718efa07bbbff427ab28a1eeaa706164" }
@@ -66,26 +66,19 @@ beacon-api-client = { git = "https://github.com/ralexstokes/ethereum-consensus.g
 [dev-dependencies]
 blake3 = { version = "=1.5" }
 
-
 [patch.crates-io]
 ssz_rs = { git = "https://github.com/ralexstokes/ssz-rs", rev = "5f1ec833718efa07bbbff427ab28a1eeaa706164" }
-# halo2-base = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/zkevm-sha256-builder" }
-# halo2-ecc = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/zkevm-sha256-builder" }
-# zkevm-hashes = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/zkevm-sha256-builder" }
-halo2-base = { path = "../halo2-lib/halo2-base" }
-halo2-ecc = { path = "../halo2-lib/halo2-ecc" }
-zkevm-hashes = { path = "../halo2-lib/hashes/zkevm" }
+halo2-base = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/bls12-381_zkevm-sha256-axiom" }
+halo2-ecc = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/bls12-381_zkevm-sha256-axiom" }
+zkevm-hashes = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/bls12-381_zkevm-sha256-axiom" }
 
 [patch."https://github.com/axiom-crypto/halo2-lib"]
-# halo2-base = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/zkevm-sha256-builder" }
-# halo2-ecc = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/zkevm-sha256-builder" }
-# zkevm-hashes = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/zkevm-sha256-builder" }
-halo2-base = { path = "../halo2-lib/halo2-base" }
-halo2-ecc = { path = "../halo2-lib/halo2-ecc" }
-zkevm-hashes = { path = "../halo2-lib/hashes/zkevm" }
+halo2-base = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/bls12-381_zkevm-sha256-axiom" }
+halo2-ecc = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/bls12-381_zkevm-sha256-axiom" }
+zkevm-hashes = { git = "https://github.com/timoftime/halo2-lib", branch = "feat/bls12-381_zkevm-sha256-axiom" }
 
 
 [patch."https://github.com/axiom-crypto/axiom-eth"]
-axiom-eth = { version = "=0.4.0", path = "../axiom-eth/axiom-eth" }
-axiom-query = { version = "=2.0.14", path = "../axiom-eth/axiom-query" }
-axiom-codec = { version = "0.2.0", path = "../axiom-eth/axiom-codec" }
+axiom-eth = { version = "=0.4.0", git = "https://github.com/nulltea/axiom-eth", branch = "feat/beacon-subquery" }
+axiom-query = { version = "=2.0.14", git = "https://github.com/nulltea/axiom-eth", branch = "feat/beacon-subquery" }
+axiom-codec = { version = "=0.2.0", git = "https://github.com/nulltea/axiom-eth", branch = "feat/beacon-subquery" }
